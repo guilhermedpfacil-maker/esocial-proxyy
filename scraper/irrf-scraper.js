@@ -345,94 +345,260 @@ class ESocialIRRFScraper {
     console.log('[Scraper] Elementos clicáveis disponíveis:', JSON.stringify(buttons1.slice(0, 15), null, 2));
     
     // ============================================
-    // PASSO 2: Clicar em "Entrar com gov.br"
+    // PASSO 2: Clicar em "Entrar com gov.br" - PRIORIZAR POR URL/HREF
     // ============================================
-    console.log('[Scraper] PASSO 2: Procurando botão "Entrar com gov.br"...');
+    console.log('[Scraper] PASSO 2: Procurando link/botão SSO gov.br (prioridade por href)...');
     
-    let govBrClicked = await clickByText(this.page, 'Entrar com gov.br', 'a, button, div, span, input');
+    // 1. PRIORIDADE MÁXIMA: Elementos com href apontando para acesso.gov.br/sso
+    let govBrClicked = await this.page.evaluate(() => {
+      // Buscar todos os links e botões
+      const candidates = Array.from(document.querySelectorAll('a, button, div[role="button"], span[role="button"]'));
+      
+      // Calcular score para cada candidato
+      const scored = candidates.map(el => {
+        const href = el.getAttribute('href') || '';
+        const text = (el.textContent || '').toLowerCase();
+        const onclick = el.getAttribute('onclick') || '';
+        
+        let score = 0;
+        
+        // Href com sso.acesso.gov.br = melhor opção
+        if (href.includes('sso.acesso.gov.br')) score += 100;
+        else if (href.includes('acesso.gov.br')) score += 80;
+        else if (href.includes('gov.br') && !href.includes('#')) score += 40;
+        
+        // Texto "entrar com gov.br"
+        if (text.includes('entrar com gov.br')) score += 30;
+        else if (text.includes('entrar') && text.includes('gov')) score += 20;
+        else if (text.includes('gov.br') && text.includes('entrar')) score += 15;
+        
+        // Onclick com redirect/gov.br
+        if (onclick.includes('gov.br')) score += 10;
+        
+        // Penalizar links de rodapé/footer
+        const parent = el.closest('footer, .footer, .rodape');
+        if (parent) score -= 50;
+        
+        return { el, score, href, text: text.substring(0, 60) };
+      }).filter(c => c.score > 0);
+      
+      // Ordenar por score descendente
+      scored.sort((a, b) => b.score - a.score);
+      
+      // Logar candidatos para debug
+      console.log('[Scraper] PASSO 2 - Candidatos gov.br:', scored.slice(0, 5).map(c => ({ score: c.score, href: c.href, text: c.text })));
+      
+      if (scored.length > 0) {
+        const best = scored[0];
+        console.log('[Scraper] PASSO 2 - Clicando no melhor candidato:', { score: best.score, href: best.href, text: best.text });
+        best.el.click();
+        return { clicked: true, href: best.href, text: best.text };
+      }
+      
+      return null;
+    });
     
     if (!govBrClicked) {
-      // Tentar variações do texto
-      const alternatives = ['gov.br', 'entrar com gov', 'acesso gov.br', 'Acesse sua conta'];
-      for (const alt of alternatives) {
-        govBrClicked = await clickByText(this.page, alt, 'a, button, div, span');
-        if (govBrClicked) {
-          console.log(`[Scraper] Clicou usando texto alternativo: "${alt}"`);
-          break;
-        }
+      // 2. FALLBACK: Tentar por texto exato
+      console.log('[Scraper] PASSO 2 - Fallback: buscando por texto...');
+      const textClicked = await clickByText(this.page, 'Entrar com gov.br', 'a, button, div, span, input');
+      if (textClicked) {
+        govBrClicked = { clicked: true, method: 'text', text: 'Entrar com gov.br' };
       }
     }
     
     if (!govBrClicked) {
-      // Tentar seletor de link que contém gov.br na URL
-      const linkClicked = await this.page.evaluate(() => {
-        const links = document.querySelectorAll('a[href*="gov.br"], a[href*="acesso"], button');
-        for (const link of links) {
-          if (link.textContent && (link.textContent.includes('gov') || link.textContent.includes('Entrar'))) {
-            link.click();
-            return true;
-          }
-        }
-        return false;
-      });
-      govBrClicked = linkClicked;
-    }
-    
-    if (!govBrClicked) {
       await this.page.screenshot({ path: '/tmp/esocial_erro_govbr_nao_encontrado.png' });
+      
+      // Dump de links disponíveis para debug
+      const allLinks = await this.page.$$eval('a', els => 
+        els.map(el => ({ href: el.href, text: el.textContent?.trim().substring(0, 40) }))
+          .filter(l => l.href && l.href.includes('gov'))
+      );
+      console.log('[Scraper] PASSO 2 - Links com "gov" disponíveis:', allLinks);
+      
       throw new Error('Botão "Entrar com gov.br" não encontrado na página do eSocial');
     }
     
-    console.log('[Scraper] Clicou em "Entrar com gov.br". Aguardando redirecionamento...');
+    console.log('[Scraper] PASSO 2: Clicou em gov.br. Aguardando redirecionamento ou nova aba...');
     
-    // Aguardar redirecionamento para gov.br
+    // 3. DETECTAR NOVA ABA/JANELA (SSO pode abrir em nova aba)
+    let newPageOpened = false;
     try {
-      await this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 });
+      const newTarget = await this.browser.waitForTarget(
+        target => {
+          const url = target.url();
+          return url.includes('acesso.gov.br') || url.includes('sso.acesso.gov.br');
+        },
+        { timeout: 10000 }
+      );
+      
+      if (newTarget) {
+        console.log('[Scraper] PASSO 2: Nova aba detectada para gov.br!');
+        const newPage = await newTarget.page();
+        if (newPage && newPage !== this.page) {
+          // Trocar para a nova página
+          this.page = newPage;
+          await this.page.bringToFront();
+          newPageOpened = true;
+          console.log('[Scraper] PASSO 2: Trocou para nova aba. URL:', this.page.url());
+        }
+      }
     } catch (e) {
-      console.log('[Scraper] Timeout na navegação, verificando estado atual...');
+      console.log('[Scraper] PASSO 2: Nenhuma nova aba detectada (normal se redirecionou na mesma aba)');
+    }
+    
+    // 4. Se não abriu nova aba, aguardar navegação normal
+    if (!newPageOpened) {
+      try {
+        await this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 });
+      } catch (e) {
+        console.log('[Scraper] PASSO 2: Timeout na navegação, verificando estado...');
+      }
     }
     
     await sleep(2000);
     await this.page.screenshot({ path: '/tmp/esocial_02_pagina_govbr.png' });
     
     const govBrUrl = this.page.url();
-    console.log('[Scraper] URL após clicar gov.br:', govBrUrl);
-    console.log('[Scraper] Título:', await this.page.title());
+    console.log('[Scraper] PASSO 2: URL após clique gov.br:', govBrUrl);
+    console.log('[Scraper] PASSO 2: Título:', await this.page.title());
     
-    // Verificar se estamos na página do gov.br
-    if (!govBrUrl.includes('acesso.gov.br') && !govBrUrl.includes('sso.acesso.gov.br')) {
-      console.log('[Scraper] AVISO: Não parece estar na página do gov.br. Continuando mesmo assim...');
+    // 5. VALIDAÇÃO: Verificar se realmente saiu da página inicial do eSocial
+    if (govBrUrl.includes('login.esocial.gov.br/login.aspx')) {
+      console.log('[Scraper] PASSO 2: AVISO - Ainda na página inicial do eSocial após 15s');
+      
+      // Segunda tentativa: clicar especificamente em links com href para gov.br
+      const retryClicked = await this.page.evaluate(() => {
+        const ssoLinks = Array.from(document.querySelectorAll('a[href*="sso.acesso.gov.br"], a[href*="acesso.gov.br"]'));
+        if (ssoLinks.length > 0) {
+          console.log('[Scraper] PASSO 2 - Retry: encontrados', ssoLinks.length, 'links SSO');
+          ssoLinks[0].click();
+          return true;
+        }
+        return false;
+      });
+      
+      if (retryClicked) {
+        console.log('[Scraper] PASSO 2: Retry - clicou em link SSO direto');
+        await sleep(5000);
+        console.log('[Scraper] PASSO 2: URL após retry:', this.page.url());
+      }
+      
+      // Se ainda estiver na página inicial, falhar
+      if (this.page.url().includes('login.esocial.gov.br/login.aspx')) {
+        await this.page.screenshot({ path: '/tmp/esocial_erro_passo2_nao_redirecionou.png' });
+        
+        const availableLinks = await this.page.$$eval('a', els => 
+          els.map(el => ({ href: el.href?.substring(0, 80), text: el.textContent?.trim().substring(0, 40) }))
+            .filter(l => l.href)
+            .slice(0, 20)
+        );
+        console.log('[Scraper] PASSO 2: Links disponíveis:', JSON.stringify(availableLinks, null, 2));
+        
+        throw new Error('PASSO 2 falhou: clique em gov.br não redirecionou para SSO. O link pode ter mudado.');
+      }
     }
     
-    // Listar elementos para debug
-    const buttons2 = await this.page.$$eval('a, button, div[role="button"], li', els => 
-      els.map(el => el.textContent?.trim().substring(0, 60)).filter(Boolean)
+    // Listar elementos para debug na página do gov.br
+    const buttons2 = await this.page.$$eval('a, button, div[role="button"], li, [class*="card"], [class*="option"]', els => 
+      els.map(el => ({
+        tag: el.tagName,
+        text: el.textContent?.trim().substring(0, 50),
+        classes: el.className?.substring?.(0, 30) || ''
+      })).filter(e => e.text)
     );
-    console.log('[Scraper] Elementos disponíveis na página gov.br:', buttons2.slice(0, 20));
+    console.log('[Scraper] PASSO 2: Elementos na página gov.br:', JSON.stringify(buttons2.slice(0, 15), null, 2));
     
     // ============================================
-    // PASSO 3: Clicar em "Seu certificado digital"
+    // PASSO 3: Clicar em "Seu certificado digital" - MELHORADO
     // ============================================
     console.log('[Scraper] PASSO 3: Procurando opção "Seu certificado digital"...');
     
-    let certClicked = await clickByText(this.page, 'Seu certificado digital', 'a, button, div, span, li, label');
+    // 1. Buscar por seletores conhecidos do gov.br + texto
+    let certClicked = await this.page.evaluate(() => {
+      // Seletores comuns no gov.br para opções de login
+      const selectors = [
+        '[data-testid*="certificado"]',
+        '[data-testid*="certificate"]',
+        '[aria-label*="certificado"]',
+        '.card-certificado',
+        '.option-certificado',
+        'li[class*="certificado"]',
+        'div[class*="certificado"]'
+      ];
+      
+      // Tentar seletores específicos primeiro
+      for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (el) {
+          console.log('[Scraper] PASSO 3: Encontrou por seletor:', sel);
+          el.click();
+          return { clicked: true, method: 'selector', selector: sel };
+        }
+      }
+      
+      // Buscar por texto em elementos visíveis
+      const candidates = Array.from(document.querySelectorAll('a, button, div, span, li, label, [role="button"], [class*="card"], [class*="option"]'));
+      
+      const withCert = candidates.filter(el => {
+        const text = (el.textContent || '').toLowerCase();
+        const rect = el.getBoundingClientRect();
+        const isVisible = rect.width > 0 && rect.height > 0;
+        return isVisible && (
+          text.includes('seu certificado digital') ||
+          text.includes('certificado digital') ||
+          text.includes('e-cpf') ||
+          text.includes('e-cnpj')
+        );
+      });
+      
+      // Ordenar por posição (mais acima = provavelmente mais relevante)
+      withCert.sort((a, b) => {
+        const rectA = a.getBoundingClientRect();
+        const rectB = b.getBoundingClientRect();
+        return rectA.top - rectB.top;
+      });
+      
+      console.log('[Scraper] PASSO 3: Candidatos "certificado":', withCert.length);
+      
+      if (withCert.length > 0) {
+        const best = withCert[0];
+        const text = best.textContent?.trim().substring(0, 50);
+        console.log('[Scraper] PASSO 3: Clicando em:', text);
+        best.click();
+        return { clicked: true, method: 'text', text };
+      }
+      
+      return null;
+    });
     
     if (!certClicked) {
-      // Tentar variações
-      const certAlternatives = ['certificado digital', 'Certificado Digital', 'certificado', 'e-CPF', 'e-CNPJ'];
-      for (const alt of certAlternatives) {
-        certClicked = await clickByText(this.page, alt, 'a, button, div, span, li, label');
-        if (certClicked) {
-          console.log(`[Scraper] Clicou usando texto alternativo: "${alt}"`);
-          break;
-        }
+      // 2. Fallback: clickByText genérico
+      console.log('[Scraper] PASSO 3: Fallback - buscando por texto genérico...');
+      const textClicked = await clickByText(this.page, 'certificado', 'a, button, div, span, li, label');
+      if (textClicked) {
+        certClicked = { clicked: true, method: 'fallback-text' };
       }
     }
     
     if (!certClicked) {
       await this.page.screenshot({ path: '/tmp/esocial_erro_certificado_nao_encontrado.png' });
+      
+      // Dump de opções disponíveis para debug
+      const options = await this.page.$$eval('a, button, li, [class*="card"], [class*="option"]', els =>
+        els.map(el => ({
+          tag: el.tagName,
+          text: el.textContent?.trim().substring(0, 60),
+          classes: el.className?.substring?.(0, 40) || ''
+        })).filter(e => e.text).slice(0, 20)
+      );
+      console.log('[Scraper] PASSO 3: Opções disponíveis:', JSON.stringify(options, null, 2));
+      
       throw new Error('Opção "Seu certificado digital" não encontrada na página do gov.br');
     }
+    
+    console.log('[Scraper] PASSO 3: Clicou em certificado digital:', JSON.stringify(certClicked));
     
     console.log('[Scraper] Clicou em "Seu certificado digital". Aguardando popup/autenticação...');
     
