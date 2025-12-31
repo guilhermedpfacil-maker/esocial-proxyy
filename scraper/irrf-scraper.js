@@ -246,7 +246,7 @@ class ESocialIRRFScraper {
     console.log('[Scraper] Launching browser with certificate support...');
     
     this.browser = await puppeteer.launch({
-      headless: 'new',
+      headless: 'false',
       userDataDir: this.tempUserDataDir,
       args: [
         '--no-sandbox',
@@ -261,6 +261,7 @@ class ESocialIRRFScraper {
         '--auto-select-certificate-for-urls=*esocial.gov.br*,*login.esocial.gov.br*,*.gov.br*',
         // Usar NSS database do perfil
         '--allow-running-insecure-content',
+        '--display=:99',
       ],
     });
 
