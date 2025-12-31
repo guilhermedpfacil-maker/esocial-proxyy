@@ -345,72 +345,123 @@ class ESocialIRRFScraper {
     console.log('[Scraper] Elementos clicáveis disponíveis:', JSON.stringify(buttons1.slice(0, 15), null, 2));
     
     // ============================================
-    // PASSO 2: Clicar em "Entrar com gov.br" - PRIORIZAR POR URL/HREF
+    // PASSO 2: Clicar em "Entrar com gov.br" no box "Acesso GOV.BR"
     // ============================================
-    console.log('[Scraper] PASSO 2: Procurando link/botão SSO gov.br (prioridade por href)...');
+    console.log('[Scraper] PASSO 2: Procurando box "Acesso GOV.BR" e botão "Entrar com gov.br"...');
     
-    // 1. PRIORIDADE MÁXIMA: Elementos com href apontando para acesso.gov.br/sso
+    // ESTRATÉGIA 1: Encontrar container "Acesso GOV.BR" e clicar no botão DENTRO dele
     let govBrClicked = await this.page.evaluate(() => {
-      // Buscar todos os links e botões
-      const candidates = Array.from(document.querySelectorAll('a, button, div[role="button"], span[role="button"]'));
+      // Buscar containers que podem conter o box "Acesso GOV.BR"
+      const containers = document.querySelectorAll('div, section, aside, fieldset, article');
       
-      // Calcular score para cada candidato
-      const scored = candidates.map(el => {
-        const href = el.getAttribute('href') || '';
-        const text = (el.textContent || '').toLowerCase();
-        const onclick = el.getAttribute('onclick') || '';
+      for (const container of containers) {
+        // Verificar se o container tem um header/título com "Acesso GOV.BR"
+        const headers = container.querySelectorAll('h1, h2, h3, h4, h5, h6, legend, strong, span, p');
+        let isGovBrBox = false;
         
-        let score = 0;
+        for (const header of headers) {
+          const text = (header.textContent || '').toLowerCase().trim();
+          if (text.includes('acesso gov') || text === 'gov.br' || text.includes('acesso gov.br')) {
+            // Verificar que não é um container muito grande (como o body)
+            const rect = container.getBoundingClientRect();
+            if (rect.width < 800 && rect.height < 600 && rect.width > 100) {
+              isGovBrBox = true;
+              break;
+            }
+          }
+        }
         
-        // Href com sso.acesso.gov.br = melhor opção
-        if (href.includes('sso.acesso.gov.br')) score += 100;
-        else if (href.includes('acesso.gov.br')) score += 80;
-        else if (href.includes('gov.br') && !href.includes('#')) score += 40;
-        
-        // Texto "entrar com gov.br"
-        if (text.includes('entrar com gov.br')) score += 30;
-        else if (text.includes('entrar') && text.includes('gov')) score += 20;
-        else if (text.includes('gov.br') && text.includes('entrar')) score += 15;
-        
-        // Onclick com redirect/gov.br
-        if (onclick.includes('gov.br')) score += 10;
-        
-        // Penalizar links de rodapé/footer
-        const parent = el.closest('footer, .footer, .rodape');
-        if (parent) score -= 50;
-        
-        return { el, score, href, text: text.substring(0, 60) };
-      }).filter(c => c.score > 0);
-      
-      // Ordenar por score descendente
-      scored.sort((a, b) => b.score - a.score);
-      
-      // Logar candidatos para debug
-      console.log('[Scraper] PASSO 2 - Candidatos gov.br:', scored.slice(0, 5).map(c => ({ score: c.score, href: c.href, text: c.text })));
-      
-      if (scored.length > 0) {
-        const best = scored[0];
-        console.log('[Scraper] PASSO 2 - Clicando no melhor candidato:', { score: best.score, href: best.href, text: best.text });
-        best.el.click();
-        return { clicked: true, href: best.href, text: best.text };
+        if (isGovBrBox) {
+          console.log('[Scraper] PASSO 2: Encontrou container "Acesso GOV.BR"');
+          
+          // Dentro do container, buscar botão "Entrar com gov.br" ou "Entrar"
+          const buttons = container.querySelectorAll('a, button, [role="button"], input[type="submit"]');
+          for (const btn of buttons) {
+            const text = (btn.textContent || '').toLowerCase().trim();
+            if (text.includes('entrar com gov.br') || text.includes('entrar com gov')) {
+              console.log('[Scraper] PASSO 2: Clicando em:', btn.textContent.trim());
+              btn.click();
+              return { clicked: true, method: 'container-entrar-govbr', text: btn.textContent.trim() };
+            }
+          }
+          
+          // Fallback: qualquer botão com "entrar" dentro do container
+          for (const btn of buttons) {
+            const text = (btn.textContent || '').toLowerCase().trim();
+            if (text.includes('entrar') && !text.includes('cadastr')) {
+              console.log('[Scraper] PASSO 2: Clicando em (fallback):', btn.textContent.trim());
+              btn.click();
+              return { clicked: true, method: 'container-entrar', text: btn.textContent.trim() };
+            }
+          }
+        }
       }
       
       return null;
     });
     
+    // ESTRATÉGIA 2: Se não encontrou container, buscar por href específico do SSO eSocial
     if (!govBrClicked) {
-      // 2. FALLBACK: Tentar por texto exato
-      console.log('[Scraper] PASSO 2 - Fallback: buscando por texto...');
+      console.log('[Scraper] PASSO 2: Container não encontrado, buscando por href SSO...');
+      
+      govBrClicked = await this.page.evaluate(() => {
+        const candidates = Array.from(document.querySelectorAll('a, button, div[role="button"]'));
+        
+        const scored = candidates.map(el => {
+          const href = el.getAttribute('href') || '';
+          const text = (el.textContent || '').toLowerCase();
+          
+          let score = 0;
+          
+          // Href com sso.acesso.gov.br = melhor opção (SSO correto)
+          if (href.includes('sso.acesso.gov.br')) score += 100;
+          else if (href.includes('acesso.gov.br') && href.includes('client_id=login.esocial')) score += 90;
+          else if (href.includes('acesso.gov.br')) score += 50;
+          
+          // PENALIZAR www.gov.br (portal genérico, NÃO é SSO!)
+          if (href.includes('www.gov.br') && !href.includes('sso.acesso')) score -= 100;
+          
+          // Texto "entrar com gov.br"
+          if (text.includes('entrar com gov.br')) score += 30;
+          else if (text.includes('entrar') && text.includes('gov')) score += 20;
+          
+          // Penalizar links de rodapé/footer
+          const parent = el.closest('footer, .footer, .rodape');
+          if (parent) score -= 50;
+          
+          // Penalizar links genéricos (privacidade, termos, etc)
+          if (text.includes('privacidade') || text.includes('termos') || text.includes('política')) score -= 100;
+          
+          return { el, score, href, text: text.substring(0, 60) };
+        }).filter(c => c.score > 0);
+        
+        scored.sort((a, b) => b.score - a.score);
+        
+        console.log('[Scraper] PASSO 2 - Candidatos SSO:', scored.slice(0, 5).map(c => ({ score: c.score, href: c.href, text: c.text })));
+        
+        if (scored.length > 0) {
+          const best = scored[0];
+          console.log('[Scraper] PASSO 2 - Clicando no melhor candidato:', { score: best.score, href: best.href, text: best.text });
+          best.el.click();
+          return { clicked: true, method: 'score-href', href: best.href, text: best.text };
+        }
+        
+        return null;
+      });
+    }
+    
+    // ESTRATÉGIA 3: Fallback por texto exato
+    if (!govBrClicked) {
+      console.log('[Scraper] PASSO 2 - Fallback: buscando por texto "Entrar com gov.br"...');
       const textClicked = await clickByText(this.page, 'Entrar com gov.br', 'a, button, div, span, input');
       if (textClicked) {
-        govBrClicked = { clicked: true, method: 'text', text: 'Entrar com gov.br' };
+        govBrClicked = { clicked: true, method: 'text-fallback', text: 'Entrar com gov.br' };
       }
     }
     
     if (!govBrClicked) {
       await this.page.screenshot({ path: '/tmp/esocial_erro_govbr_nao_encontrado.png' });
       
-      // Dump de links disponíveis para debug
       const allLinks = await this.page.$$eval('a', els => 
         els.map(el => ({ href: el.href, text: el.textContent?.trim().substring(0, 40) }))
           .filter(l => l.href && l.href.includes('gov'))
@@ -420,24 +471,23 @@ class ESocialIRRFScraper {
       throw new Error('Botão "Entrar com gov.br" não encontrado na página do eSocial');
     }
     
-    console.log('[Scraper] PASSO 2: Clicou em gov.br. Aguardando redirecionamento ou nova aba...');
+    console.log('[Scraper] PASSO 2: Clicou em gov.br (método:', govBrClicked.method, '). Aguardando redirecionamento...');
     
-    // 3. DETECTAR NOVA ABA/JANELA (SSO pode abrir em nova aba)
+    // DETECTAR NOVA ABA/JANELA (SSO pode abrir em nova aba)
     let newPageOpened = false;
     try {
       const newTarget = await this.browser.waitForTarget(
         target => {
           const url = target.url();
-          return url.includes('acesso.gov.br') || url.includes('sso.acesso.gov.br');
+          return url.includes('sso.acesso.gov.br') || url.includes('acesso.gov.br/login');
         },
         { timeout: 10000 }
       );
       
       if (newTarget) {
-        console.log('[Scraper] PASSO 2: Nova aba detectada para gov.br!');
+        console.log('[Scraper] PASSO 2: Nova aba detectada para SSO gov.br!');
         const newPage = await newTarget.page();
         if (newPage && newPage !== this.page) {
-          // Trocar para a nova página
           this.page = newPage;
           await this.page.bringToFront();
           newPageOpened = true;
@@ -448,7 +498,7 @@ class ESocialIRRFScraper {
       console.log('[Scraper] PASSO 2: Nenhuma nova aba detectada (normal se redirecionou na mesma aba)');
     }
     
-    // 4. Se não abriu nova aba, aguardar navegação normal
+    // Se não abriu nova aba, aguardar navegação normal
     if (!newPageOpened) {
       try {
         await this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 });
@@ -464,16 +514,29 @@ class ESocialIRRFScraper {
     console.log('[Scraper] PASSO 2: URL após clique gov.br:', govBrUrl);
     console.log('[Scraper] PASSO 2: Título:', await this.page.title());
     
-    // 5. VALIDAÇÃO: Verificar se realmente saiu da página inicial do eSocial
+    // VALIDAÇÃO CRÍTICA: Verificar se está no SSO correto
+    if (govBrUrl.includes('www.gov.br') && !govBrUrl.includes('sso.acesso.gov.br')) {
+      await this.page.screenshot({ path: '/tmp/esocial_erro_portal_generico.png' });
+      console.log('[Scraper] ERRO CRÍTICO: Clique levou para portal genérico www.gov.br!');
+      throw new Error('PASSO 2 falhou: redirecionou para www.gov.br (portal genérico) em vez de sso.acesso.gov.br (SSO). O clique pegou o link errado.');
+    }
+    
+    // Verificar se ainda está na página inicial do eSocial
     if (govBrUrl.includes('login.esocial.gov.br/login.aspx')) {
-      console.log('[Scraper] PASSO 2: AVISO - Ainda na página inicial do eSocial após 15s');
+      console.log('[Scraper] PASSO 2: AVISO - Ainda na página inicial do eSocial após clique');
       
-      // Segunda tentativa: clicar especificamente em links com href para gov.br
+      // Segunda tentativa: clicar diretamente em link SSO
       const retryClicked = await this.page.evaluate(() => {
         const ssoLinks = Array.from(document.querySelectorAll('a[href*="sso.acesso.gov.br"], a[href*="acesso.gov.br"]'));
-        if (ssoLinks.length > 0) {
-          console.log('[Scraper] PASSO 2 - Retry: encontrados', ssoLinks.length, 'links SSO');
-          ssoLinks[0].click();
+        // Filtrar links que NÃO são www.gov.br genérico
+        const validLinks = ssoLinks.filter(el => {
+          const href = el.getAttribute('href') || '';
+          return !href.includes('www.gov.br') || href.includes('sso.acesso');
+        });
+        
+        if (validLinks.length > 0) {
+          console.log('[Scraper] PASSO 2 - Retry: encontrados', validLinks.length, 'links SSO válidos');
+          validLinks[0].click();
           return true;
         }
         return false;
@@ -496,8 +559,15 @@ class ESocialIRRFScraper {
         );
         console.log('[Scraper] PASSO 2: Links disponíveis:', JSON.stringify(availableLinks, null, 2));
         
-        throw new Error('PASSO 2 falhou: clique em gov.br não redirecionou para SSO. O link pode ter mudado.');
+        throw new Error('PASSO 2 falhou: clique em gov.br não redirecionou para SSO.');
       }
+    }
+    
+    // Verificar se está no SSO correto
+    if (!govBrUrl.includes('acesso.gov.br') && !govBrUrl.includes('sso.acesso.gov.br')) {
+      console.log('[Scraper] PASSO 2: AVISO - URL não parece ser do SSO gov.br:', govBrUrl);
+    } else {
+      console.log('[Scraper] PASSO 2: OK - Redirecionou para SSO gov.br');
     }
     
     // Listar elementos para debug na página do gov.br
