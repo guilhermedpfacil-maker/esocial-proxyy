@@ -134,17 +134,34 @@ app.post('/api/esocial-irrf', rateLimit, async (req, res) => {
       await scraper.close();
       
       const elapsed = Date.now() - startTime;
-      const successCount = results.filter(r => r.success).length;
       
-      console.log(`[eSocial IRRF] Completed: ${successCount}/${results.length} successful in ${elapsed}ms`);
+      // CORREÇÃO: Garantir que results é array antes de usar .filter()
+      const safeResults = Array.isArray(results) ? results : [];
+      
+      if (!Array.isArray(results)) {
+        console.error('[eSocial IRRF] AVISO: scraper retornou algo que não é array:', typeof results);
+        return res.status(500).json({
+          success: false,
+          error: 'Resposta inesperada do scraper (não é array)',
+          details: {
+            type: typeof results,
+            preview: String(results).substring(0, 200)
+          },
+          elapsed
+        });
+      }
+      
+      const successCount = safeResults.filter(r => r && r.success).length;
+      
+      console.log(`[eSocial IRRF] Completed: ${successCount}/${safeResults.length} successful in ${elapsed}ms`);
 
       res.json({
         success: true,
-        data: results,
+        data: safeResults,
         summary: {
-          total: results.length,
+          total: safeResults.length,
           successful: successCount,
-          failed: results.length - successCount
+          failed: safeResults.length - successCount
         },
         elapsed
       });
