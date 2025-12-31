@@ -7,6 +7,13 @@
  * Deploy: Render.com, Railway.app, DigitalOcean, Fly.io, ou qualquer servidor com Node.js
  */
 
+// ========== VERSÃO DO PROXY ==========
+const PROXY_VERSION = 'v2.1.0-sso-fix-2024-12-31';
+console.log(`[eSocial Proxy] ========================================`);
+console.log(`[eSocial Proxy] VERSÃO: ${PROXY_VERSION}`);
+console.log(`[eSocial Proxy] Build: ${new Date().toISOString()}`);
+console.log(`[eSocial Proxy] ========================================`);
+
 const express = require('express');
 const https = require('https');
 const cors = require('cors');
