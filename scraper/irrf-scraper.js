@@ -249,21 +249,19 @@ class ESocialIRRFScraper {
     this.browser = await puppeteer.launch({
       headless: false, // IMPORTANTE: false para permitir popup de certificado via Xvfb
       userDataDir: this.tempUserDataDir,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--disable-gpu',
-        '--window-size=1920,1080',
-        '--display=' + (process.env.DISPLAY || ':99'), // Usar Xvfb display
-        // Ignorar erros de certificado do servidor (não do cliente)
-        '--ignore-certificate-errors',
-        // Auto-selecionar certificado para domínios gov.br
-        '--auto-select-certificate-for-urls=*esocial.gov.br*,*login.esocial.gov.br*,*.gov.br*,*sso.acesso.gov.br*',
-        // Usar NSS database do perfil
-        '--allow-running-insecure-content',
-      ],
+args: [
+  '--no-sandbox',
+  '--disable-setuid-sandbox',
+  '--disable-dev-shm-usage',
+  '--disable-accelerated-2d-canvas',
+  '--disable-gpu',
+  '--window-size=1920,1080',
+  '--display=' + (process.env.DISPLAY || ':99'),
+  '--ignore-certificate-errors',
+  '--allow-running-insecure-content',
+  // Auto-selecionar certificado - formato JSON correto
+  '--auto-select-certificate-for-urls={"pattern":"*","filter":{}}',
+],
     });
 
     this.page = await this.browser.newPage();
