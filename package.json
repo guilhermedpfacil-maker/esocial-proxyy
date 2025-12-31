@@ -1,15 +1,18 @@
 {
   "name": "esocial-proxy",
-  "version": "1.0.0",
-  "description": "Proxy mTLS para integração com eSocial",
+  "version": "1.1.0",
+  "description": "Proxy Node.js para comunicação mTLS + Web Scraping IRRF com eSocial",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "node index.js"
+    "dev": "node --watch index.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
-    "express": "^4.18.2"
+    "express": "^4.18.2",
+    "puppeteer": "^21.6.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
   },
   "engines": {
     "node": ">=18.0.0"
