@@ -242,11 +242,12 @@ class ESocialIRRFScraper {
       throw new Error(`Falha ao configurar certificado NSS: ${error.message}`);
     }
 
-    // 6. Iniciar browser com NSS configurado
+    // 6. Iniciar browser com NSS configurado (headless: false para popup de certificado)
     console.log('[Scraper] Launching browser with certificate support...');
+    console.log('[Scraper] DISPLAY env:', process.env.DISPLAY);
     
     this.browser = await puppeteer.launch({
-      headless: 'false',
+      headless: false, // IMPORTANTE: false para permitir popup de certificado via Xvfb
       userDataDir: this.tempUserDataDir,
       args: [
         '--no-sandbox',
@@ -255,13 +256,13 @@ class ESocialIRRFScraper {
         '--disable-accelerated-2d-canvas',
         '--disable-gpu',
         '--window-size=1920,1080',
+        '--display=' + (process.env.DISPLAY || ':99'), // Usar Xvfb display
         // Ignorar erros de certificado do servidor (não do cliente)
         '--ignore-certificate-errors',
         // Auto-selecionar certificado para domínios gov.br
-        '--auto-select-certificate-for-urls=*esocial.gov.br*,*login.esocial.gov.br*,*.gov.br*',
+        '--auto-select-certificate-for-urls=*esocial.gov.br*,*login.esocial.gov.br*,*.gov.br*,*sso.acesso.gov.br*',
         // Usar NSS database do perfil
         '--allow-running-insecure-content',
-        '--display=:99',
       ],
     });
 
@@ -277,7 +278,7 @@ class ESocialIRRFScraper {
 
     // Listener para requests de certificado cliente
     this.page.on('request', request => {
-      if (request.url().includes('esocial.gov.br')) {
+      if (request.url().includes('esocial.gov.br') || request.url().includes('gov.br')) {
         console.log('[Scraper] Request to:', request.url());
       }
     });
@@ -293,111 +294,177 @@ class ESocialIRRFScraper {
   }
 
   async login() {
-    console.log('[Scraper] Navigating to eSocial login...');
+    console.log('[Scraper] === INICIANDO FLUXO DE LOGIN ===');
     
-    await this.page.goto('https://login.esocial.gov.br', { 
+    // ============================================
+    // PASSO 1: Acessar página inicial do eSocial
+    // ============================================
+    console.log('[Scraper] PASSO 1: Acessando página inicial do eSocial...');
+    await this.page.goto('https://login.esocial.gov.br/login.aspx', { 
       waitUntil: 'networkidle2' 
     });
-
-    // Aguardar carregamento da página
     await sleep(2000);
-
-    // Capturar screenshot para debug
-    await this.page.screenshot({ path: '/tmp/esocial_login.png' });
     
-    // Log da página atual para debug
-    console.log('[Scraper] Page loaded, URL:', this.page.url());
+    await this.page.screenshot({ path: '/tmp/esocial_01_pagina_inicial.png' });
+    console.log('[Scraper] Página inicial carregada. URL:', this.page.url());
+    console.log('[Scraper] Título:', await this.page.title());
     
-    // Capturar HTML da página para debug
-    const pageTitle = await this.page.title();
-    console.log('[Scraper] Page title:', pageTitle);
+    // Listar elementos clicáveis para debug
+    const buttons1 = await this.page.$$eval('button, a, div[role="button"], span[role="button"]', els => 
+      els.map(el => ({ 
+        tag: el.tagName, 
+        text: el.textContent?.trim().substring(0, 60),
+        href: el.getAttribute('href') || null
+      })).filter(e => e.text)
+    );
+    console.log('[Scraper] Elementos clicáveis disponíveis:', JSON.stringify(buttons1.slice(0, 15), null, 2));
     
-    // Tentar clicar no botão de login por certificado digital
-    try {
-      // Primeiro, tentar seletores CSS válidos
-      let certButton = await this.page.$(SELECTORS.loginCertificado);
-      
-      // Se não encontrar, tentar por texto
-      if (!certButton) {
-        console.log('[Scraper] CSS selector not found, trying text search...');
-        
-        // Listar todos os botões/links na página para debug
-        const buttons = await this.page.$$eval('button, a, div[role="button"], span[role="button"]', els => 
-          els.map(el => ({ 
-            tag: el.tagName, 
-            text: el.textContent?.trim().substring(0, 50),
-            className: el.className,
-            id: el.id
-          }))
-        );
-        console.log('[Scraper] Available buttons/links:', JSON.stringify(buttons.slice(0, 10), null, 2));
-        
-        const clicked = await clickByText(this.page, 'Certificado', 'button, a, div[role="button"]');
-        if (clicked) {
-          console.log('[Scraper] Clicked certificate login by text');
-        } else {
-          // Tentar outros textos comuns
-          const alternatives = ['certificado digital', 'e-CPF', 'e-CNPJ', 'login com certificado', 'Entrar com certificado'];
-          for (const alt of alternatives) {
-            const altClicked = await clickByText(this.page, alt, 'button, a, div[role="button"], span');
-            if (altClicked) {
-              console.log(`[Scraper] Clicked certificate login by text: "${alt}"`);
-              break;
-            }
+    // ============================================
+    // PASSO 2: Clicar em "Entrar com gov.br"
+    // ============================================
+    console.log('[Scraper] PASSO 2: Procurando botão "Entrar com gov.br"...');
+    
+    let govBrClicked = await clickByText(this.page, 'Entrar com gov.br', 'a, button, div, span, input');
+    
+    if (!govBrClicked) {
+      // Tentar variações do texto
+      const alternatives = ['gov.br', 'entrar com gov', 'acesso gov.br', 'Acesse sua conta'];
+      for (const alt of alternatives) {
+        govBrClicked = await clickByText(this.page, alt, 'a, button, div, span');
+        if (govBrClicked) {
+          console.log(`[Scraper] Clicou usando texto alternativo: "${alt}"`);
+          break;
+        }
+      }
+    }
+    
+    if (!govBrClicked) {
+      // Tentar seletor de link que contém gov.br na URL
+      const linkClicked = await this.page.evaluate(() => {
+        const links = document.querySelectorAll('a[href*="gov.br"], a[href*="acesso"], button');
+        for (const link of links) {
+          if (link.textContent && (link.textContent.includes('gov') || link.textContent.includes('Entrar'))) {
+            link.click();
+            return true;
           }
         }
-      } else {
-        await certButton.click();
-        console.log('[Scraper] Clicked certificate login button via CSS selector');
-      }
-      
-      // Aguardar processamento do certificado
-      console.log('[Scraper] Waiting for certificate authentication...');
-      await sleep(5000);
-      
-      // Capturar screenshot após tentativa de login
-      await this.page.screenshot({ path: '/tmp/esocial_after_login_attempt.png' });
-      console.log('[Scraper] Current URL after click:', this.page.url());
-      
-      // Verificar se houve redirecionamento (indica login bem-sucedido)
-      const currentUrl = this.page.url();
-      if (currentUrl.includes('login.esocial.gov.br')) {
-        console.log('[Scraper] Still on login page, checking for errors...');
-        
-        // Verificar se há mensagens de erro
-        const errorMessages = await this.page.$$eval('.alert-danger, .error, .msg-erro, [class*="error"]', els =>
-          els.map(el => el.textContent?.trim()).filter(Boolean)
-        );
-        if (errorMessages.length > 0) {
-          console.log('[Scraper] Error messages found:', errorMessages);
-        }
-        
-        // Dump de todos os elementos interativos
-        await debugDumpInputs(this.page, 'login_page_state');
-      }
-      
-      try {
-        await this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 });
-        console.log('[Scraper] Navigation completed, URL:', this.page.url());
-      } catch (navError) {
-        console.log('[Scraper] Navigation wait timed out, checking current state...');
-      }
-      
-      // Screenshot final após login
-      await this.page.screenshot({ path: '/tmp/esocial_after_login_final.png' });
-      console.log('[Scraper] Login attempt complete, current URL:', this.page.url());
-      
-      // Verificar se login foi bem-sucedido (não está mais na página de login)
-      const finalUrl = this.page.url();
-      if (finalUrl.includes('login.esocial.gov.br/login.aspx')) {
-        throw new Error('Login não completado - ainda na página de login. Verifique se o certificado está válido.');
-      }
-      
-    } catch (error) {
-      console.error('[Scraper] Login error:', error.message);
-      await this.page.screenshot({ path: '/tmp/esocial_login_error.png' });
-      throw new Error(`Falha no login: ${error.message}`);
+        return false;
+      });
+      govBrClicked = linkClicked;
     }
+    
+    if (!govBrClicked) {
+      await this.page.screenshot({ path: '/tmp/esocial_erro_govbr_nao_encontrado.png' });
+      throw new Error('Botão "Entrar com gov.br" não encontrado na página do eSocial');
+    }
+    
+    console.log('[Scraper] Clicou em "Entrar com gov.br". Aguardando redirecionamento...');
+    
+    // Aguardar redirecionamento para gov.br
+    try {
+      await this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 });
+    } catch (e) {
+      console.log('[Scraper] Timeout na navegação, verificando estado atual...');
+    }
+    
+    await sleep(2000);
+    await this.page.screenshot({ path: '/tmp/esocial_02_pagina_govbr.png' });
+    
+    const govBrUrl = this.page.url();
+    console.log('[Scraper] URL após clicar gov.br:', govBrUrl);
+    console.log('[Scraper] Título:', await this.page.title());
+    
+    // Verificar se estamos na página do gov.br
+    if (!govBrUrl.includes('acesso.gov.br') && !govBrUrl.includes('sso.acesso.gov.br')) {
+      console.log('[Scraper] AVISO: Não parece estar na página do gov.br. Continuando mesmo assim...');
+    }
+    
+    // Listar elementos para debug
+    const buttons2 = await this.page.$$eval('a, button, div[role="button"], li', els => 
+      els.map(el => el.textContent?.trim().substring(0, 60)).filter(Boolean)
+    );
+    console.log('[Scraper] Elementos disponíveis na página gov.br:', buttons2.slice(0, 20));
+    
+    // ============================================
+    // PASSO 3: Clicar em "Seu certificado digital"
+    // ============================================
+    console.log('[Scraper] PASSO 3: Procurando opção "Seu certificado digital"...');
+    
+    let certClicked = await clickByText(this.page, 'Seu certificado digital', 'a, button, div, span, li, label');
+    
+    if (!certClicked) {
+      // Tentar variações
+      const certAlternatives = ['certificado digital', 'Certificado Digital', 'certificado', 'e-CPF', 'e-CNPJ'];
+      for (const alt of certAlternatives) {
+        certClicked = await clickByText(this.page, alt, 'a, button, div, span, li, label');
+        if (certClicked) {
+          console.log(`[Scraper] Clicou usando texto alternativo: "${alt}"`);
+          break;
+        }
+      }
+    }
+    
+    if (!certClicked) {
+      await this.page.screenshot({ path: '/tmp/esocial_erro_certificado_nao_encontrado.png' });
+      throw new Error('Opção "Seu certificado digital" não encontrada na página do gov.br');
+    }
+    
+    console.log('[Scraper] Clicou em "Seu certificado digital". Aguardando popup/autenticação...');
+    
+    // ============================================
+    // PASSO 4: Aguardar popup de certificado e autenticação
+    // ============================================
+    console.log('[Scraper] PASSO 4: Aguardando seleção automática de certificado...');
+    
+    // O Chrome deve mostrar popup de seleção de certificado
+    // Com --auto-select-certificate-for-urls, deve selecionar automaticamente
+    // Aguardar tempo suficiente para o popup aparecer e ser processado
+    await sleep(8000);
+    
+    await this.page.screenshot({ path: '/tmp/esocial_03_apos_certificado.png' });
+    
+    // Tentar aguardar navegação de retorno ao eSocial
+    try {
+      await this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 });
+    } catch (e) {
+      console.log('[Scraper] Timeout aguardando navegação pós-certificado');
+    }
+    
+    await this.page.screenshot({ path: '/tmp/esocial_04_final.png' });
+    
+    const finalUrl = this.page.url();
+    const finalTitle = await this.page.title();
+    console.log('[Scraper] URL final após login:', finalUrl);
+    console.log('[Scraper] Título final:', finalTitle);
+    
+    // ============================================
+    // VERIFICAÇÃO: Login foi bem-sucedido?
+    // ============================================
+    
+    // Ainda na página de login do eSocial = falhou
+    if (finalUrl.includes('login.esocial.gov.br/login.aspx')) {
+      const errorMsgs = await this.page.$$eval('.alert, .error, .msg-erro, [class*="error"], [class*="alert"]', els =>
+        els.map(el => el.textContent?.trim()).filter(Boolean)
+      );
+      const debugInfo = {
+        url: finalUrl,
+        title: finalTitle,
+        errorMessages: errorMsgs.slice(0, 5)
+      };
+      console.log('[Scraper] DEBUG - Login falhou:', JSON.stringify(debugInfo));
+      throw new Error(`Login não completado. Ainda na página de login. Debug: ${JSON.stringify(debugInfo)}`);
+    }
+    
+    // Ainda na página do gov.br sem ter logado
+    if (finalUrl.includes('sso.acesso.gov.br') && !finalUrl.includes('authorize')) {
+      const pageContent = await this.page.content();
+      const hasLoginForm = pageContent.includes('Seu certificado') || pageContent.includes('senha');
+      if (hasLoginForm) {
+        throw new Error('Login não completado. Ainda na página do gov.br aguardando autenticação.');
+      }
+    }
+    
+    console.log('[Scraper] === LOGIN CONCLUÍDO COM SUCESSO ===');
   }
 
   async navigateToIRRF() {
