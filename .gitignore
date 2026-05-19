@@ -1,0 +1,5 @@
+node_modules/
+certificates.json
+*.pfx
+*.p12
+.env
