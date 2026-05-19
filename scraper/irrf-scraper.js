@@ -700,53 +700,83 @@ class ESocialIRRFScraper {
     console.log('[Scraper] PASSO 3: Clicou em certificado digital:', JSON.stringify(certClicked));
 
     // ============================================
-    // PASSO 3b: Capturar URL para a qual "Seu certificado digital" navega
+    // PASSO 3b: Interceptar requests para capturar URL exata do endpoint de certificado
     // ============================================
-    // Extrair href ANTES de clicar (para passar ao curl sem depender do Chrome)
-    const certHref = await this.page.evaluate(() => {
-      const texts = ['seu certificado digital', 'certificado digital', 'e-cpf', 'e-cnpj'];
-      const allEls = Array.from(document.querySelectorAll('a, button, li, div, span'));
-      for (const el of allEls) {
-        const t = (el.textContent || '').toLowerCase().trim();
-        if (texts.some(s => t.includes(s))) {
-          // Tentar pegar href próprio ou do pai mais próximo que seja um link
-          let node = el;
-          while (node && node !== document.body) {
-            if (node.tagName === 'A' && node.getAttribute('href')) {
-              const h = node.getAttribute('href');
-              return h.startsWith('http') ? h : window.location.origin + h;
-            }
-            node = node.parentElement;
-          }
-          // Verificar se há form action associado
-          const form = el.closest('form');
-          if (form && form.action) return form.action;
-        }
-      }
-      return null;
+    const interceptedRequests = [];
+    await this.page.setRequestInterception(true);
+    const reqHandler = (req) => {
+      try {
+        const url = req.url();
+        const method = req.method();
+        interceptedRequests.push({ url, method, isNav: req.isNavigationRequest() });
+        req.continue();
+      } catch {}
+    };
+    this.page.on('request', reqHandler);
+
+    // Clicar novamente para capturar o request (o primeiro clique já ocorreu acima)
+    await this.page.evaluate(() => {
+      const texts = ['seu certificado digital', 'certificado digital'];
+      const els = Array.from(document.querySelectorAll('a, button, li, div, span, [role="button"]'));
+      const match = els.find(el => texts.some(t => (el.textContent || '').toLowerCase().includes(t)));
+      if (match) match.click();
     });
-    console.log('[Scraper] PASSO 3b: href do certificado:', certHref);
 
-    console.log('[Scraper] Clicou em "Seu certificado digital". Tentando autenticação via curl...');
-
-    // ============================================
-    // PASSO 4: Autenticação mTLS via curl (confiável em containers)
-    // ============================================
     await sleep(3000);
+    this.page.off('request', reqHandler);
+    await this.page.setRequestInterception(false).catch(() => {});
+
+    // Filtrar requests relevantes (gov.br, excluindo assets)
+    const relevantReqs = interceptedRequests.filter(r =>
+      r.url.includes('gov.br') &&
+      !r.url.match(/\.(css|js|png|jpg|svg|woff|ico)(\?|$)/)
+    );
+    console.log('[Scraper] PASSO 3b: Requests após clique certificado:', JSON.stringify(relevantReqs));
+
+    // Identificar URL candidata ao endpoint de certificado
+    const certNavReq = relevantReqs.find(r => r.isNav && !r.url.includes('login.esocial'));
+    const certAnyReq = relevantReqs.find(r =>
+      r.url.includes('certificado') || r.url.includes('certificate') || r.url.includes('cert')
+    );
+    const interceptedCertUrl = certNavReq?.url || certAnyReq?.url || null;
+    console.log('[Scraper] PASSO 3b: URL interceptada do cert:', interceptedCertUrl);
+
+    // Extrair authorization_id da URL atual para construir endpoint alternativo
+    const currentSsoUrl = this.page.url();
+    const authIdMatch = currentSsoUrl.match(/authorization_id=([^&]+)/);
+    const authorizationId = authIdMatch ? authIdMatch[1] : null;
+    console.log('[Scraper] PASSO 3b: authorization_id:', authorizationId);
+
+    // Capturar cookies da sessão SSO (necessário para o curl manter o state OAuth)
+    const ssoCookies = await this.page.cookies();
+    console.log('[Scraper] PASSO 3b: Cookies SSO:', ssoCookies.map(c => c.name).join(', '));
+
     await this.page.screenshot({ path: '/tmp/esocial_04a_apos_cert_click.png' });
 
-    const urlAposCertClick = this.page.url();
-    console.log('[Scraper] PASSO 4: URL após clicar em certificado:', urlAposCertClick);
+    // ============================================
+    // PASSO 4: Tentar múltiplas URLs com curl para achar o endpoint mTLS
+    // ============================================
+    const baseUrl = 'https://sso.acesso.gov.br';
+    const candidateUrls = [
+      interceptedCertUrl,
+      authorizationId ? `${baseUrl}/login/certificado?authorization_id=${authorizationId}` : null,
+      authorizationId ? `${baseUrl}/login/certificate?authorization_id=${authorizationId}` : null,
+      authorizationId ? `${baseUrl}/certificado?authorization_id=${authorizationId}` : null,
+      currentSsoUrl.replace('/login?', '/login/certificado?'),
+    ].filter(Boolean);
 
-    // Capturar cookies da sessão SSO para passar ao curl (mantém state OAuth)
-    const ssoCookies = await this.page.cookies();
-    console.log('[Scraper] PASSO 4: Cookies SSO:', ssoCookies.map(c => c.name).join(', '));
+    console.log('[Scraper] PASSO 4: Tentando', candidateUrls.length, 'URLs candidatas com curl...');
 
-    // Usar curl com a URL específica do certificado (se disponível) ou a URL atual da página
-    // Evitar passar a página genérica de login do gov.br (que não tem cert endpoint)
-    const curlTargetUrl = (certHref && certHref !== urlAposCertClick) ? certHref : urlAposCertClick;
-    console.log('[Scraper] PASSO 4: URL para curl:', curlTargetUrl);
-    const callbackUrl = await this.authenticateWithCurl(curlTargetUrl, ssoCookies);
+    let callbackUrl = null;
+    for (const url of candidateUrls) {
+      console.log('[Scraper] PASSO 4: curl →', url);
+      const result = await this.authenticateWithCurl(url, ssoCookies);
+      console.log('[Scraper] PASSO 4: curl ←', result);
+      if (result && !result.includes('sso.acesso.gov.br') && result.includes('gov.br')) {
+        callbackUrl = result;
+        break;
+      }
+    }
 
     if (callbackUrl && !callbackUrl.includes('sso.acesso.gov.br') && callbackUrl.includes('gov.br')) {
       console.log('[Scraper] PASSO 4: ✓ curl autenticou! Navegando para callback:', callbackUrl);
