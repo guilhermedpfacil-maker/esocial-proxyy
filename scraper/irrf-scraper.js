@@ -317,76 +317,72 @@ class ESocialIRRFScraper {
     console.log('[Scraper] PASSO 2: Elementos disponíveis:', JSON.stringify(buttons2.slice(0, 15), null, 2));
 
     // ============================================
-    // PASSO 3: Clicar em "Seu certificado digital"
+    // PASSO 3: Navegar para endpoint de certificado
+    // NÃO clicar no elemento — navegar diretamente para /login/certificado
+    // para que o Playwright acione o mTLS via proxy local automaticamente
     // ============================================
-    // Garantir que a página estabilizou (pode ter redirected do /authorize para /login)
     try { await this.page.waitForLoadState('domcontentloaded', { timeout: 10000 }); } catch {}
 
-    console.log('[Scraper] PASSO 3: URL antes de buscar certificado:', this.page.url());
-    console.log('[Scraper] PASSO 3: Procurando opção "Seu certificado digital"...');
+    const urlParaCert = this.page.url();
+    console.log('[Scraper] PASSO 3: URL atual (SSO login):', urlParaCert);
 
-    // Logar HTML do elemento para debug
-    const certElementInfo = await this.page.evaluate(() => {
-      const texts = ['seu certificado digital', 'certificado digital', 'e-cpf', 'e-cnpj'];
-      const els = Array.from(document.querySelectorAll('a, button, li, div, span, [role="button"], [class*="card"], [class*="option"]'));
-      const match = els.find(el => {
-        const text = (el.textContent || '').toLowerCase();
-        const rect = el.getBoundingClientRect();
-        return rect.width > 0 && rect.height > 0 && texts.some(t => text.includes(t));
-      });
-      if (!match) return { found: false };
-      return {
-        found: true,
-        tag: match.tagName,
-        text: match.textContent?.trim().substring(0, 100),
-        href: match.getAttribute('href'),
-        outerHtml: match.outerHTML?.substring(0, 300)
-      };
-    });
-    console.log('[Scraper] PASSO 3: Elemento certificado encontrado:', JSON.stringify(certElementInfo));
+    // Extrair authorization_id da URL atual
+    const authIdMatch = urlParaCert.match(/authorization_id=([^&]+)/);
+    const authorizationId = authIdMatch ? authIdMatch[1] : null;
+    console.log('[Scraper] PASSO 3: authorization_id:', authorizationId);
 
-    let certClicked = await this.page.evaluate(() => {
-      const selectors = [
-        '[data-testid*="certificado"]', '[data-testid*="certificate"]',
-        '[aria-label*="certificado"]', '.card-certificado', '.option-certificado',
-        'li[class*="certificado"]', 'div[class*="certificado"]'
-      ];
-      for (const sel of selectors) {
-        const el = document.querySelector(sel);
-        if (el) { el.click(); return { clicked: true, method: 'selector', selector: sel }; }
+    // Tentar extrair href real do link "Seu certificado digital" na página
+    const certLinkHref = await this.page.evaluate(() => {
+      const texts = ['seu certificado digital', 'certificado digital'];
+      // Prioridade: links <a> com href
+      for (const a of document.querySelectorAll('a')) {
+        if (texts.some(t => (a.textContent || '').toLowerCase().includes(t))) {
+          const href = a.getAttribute('href');
+          if (href) return href;
+        }
       }
-
-      const texts = ['seu certificado digital', 'certificado digital', 'e-cpf', 'e-cnpj'];
-      const candidates = Array.from(document.querySelectorAll('a, button, div, span, li, label, [role="button"], [class*="card"], [class*="option"]'))
-        .filter(el => {
-          const text = (el.textContent || '').toLowerCase();
-          const rect = el.getBoundingClientRect();
-          return rect.width > 0 && rect.height > 0 && texts.some(t => text.includes(t));
-        })
-        .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
-
-      if (candidates.length > 0) {
-        candidates[0].click();
-        return { clicked: true, method: 'text', text: candidates[0].textContent?.trim().substring(0, 50) };
+      // Botões com onclick ou data-url
+      for (const btn of document.querySelectorAll('button, [role="button"], li')) {
+        if (texts.some(t => (btn.textContent || '').toLowerCase().includes(t))) {
+          const onclick = btn.getAttribute('onclick') || '';
+          const urlMatch = onclick.match(/location(?:\.href)?\s*=\s*['"]([^'"]+)['"]/);
+          if (urlMatch) return urlMatch[1];
+          const dataUrl = btn.getAttribute('data-href') || btn.getAttribute('data-url');
+          if (dataUrl) return dataUrl;
+        }
       }
       return null;
-    });
+    }).catch(() => null);
+    console.log('[Scraper] PASSO 3: href do link certificado:', certLinkHref);
 
-    if (!certClicked) {
-      const textClicked = await clickByText(this.page, 'certificado', 'a, button, div, span, li, label');
-      if (textClicked) certClicked = { clicked: true, method: 'fallback-text' };
+    // Construir URL de destino para o endpoint mTLS
+    let certNavUrl = null;
+    if (certLinkHref) {
+      certNavUrl = certLinkHref.startsWith('http')
+        ? certLinkHref
+        : `https://sso.acesso.gov.br${certLinkHref.startsWith('/') ? '' : '/'}${certLinkHref}`;
+    } else if (authorizationId) {
+      // URL padrão do gov.br para autenticação por certificado
+      certNavUrl = `https://sso.acesso.gov.br/login/certificado?authorization_id=${authorizationId}`;
     }
 
-    if (!certClicked) {
-      await this.page.screenshot({ path: '/tmp/esocial_erro_certificado_nao_encontrado.png' });
-      const options = await this.page.$$eval('a, button, li, [class*="card"]', els =>
-        els.map(el => ({ tag: el.tagName, text: el.textContent?.trim().substring(0, 60), classes: el.className?.substring?.(0, 40) || '' })).filter(e => e.text).slice(0, 20)
-      );
-      console.log('[Scraper] PASSO 3: Opções disponíveis:', JSON.stringify(options, null, 2));
-      throw new Error('Opção "Seu certificado digital" não encontrada na página do gov.br');
+    if (!certNavUrl) {
+      await this.page.screenshot({ path: '/tmp/esocial_erro_sem_cert_url.png' });
+      throw new Error('PASSO 3: não foi possível determinar URL do endpoint de certificado');
     }
 
-    console.log('[Scraper] PASSO 3: Clicou em certificado digital:', JSON.stringify(certClicked));
+    console.log('[Scraper] PASSO 3: Navegando diretamente para endpoint mTLS:', certNavUrl);
+    await this.page.screenshot({ path: '/tmp/esocial_03_antes_cert_nav.png' });
+
+    // Navegar — Playwright apresenta o certificado automaticamente no handshake TLS
+    try {
+      await this.page.goto(certNavUrl, { waitUntil: 'commit', timeout: 30000 });
+    } catch (navErr) {
+      // 'commit' pode lançar se a resposta for um redirect imediato — isso é esperado
+      console.log('[Scraper] PASSO 3: goto retornou (pode ser redirect):', navErr.message?.substring(0, 80));
+    }
+    await sleep(2000);
+    console.log('[Scraper] PASSO 3: URL após navegar para cert endpoint:', this.page.url());
 
     // ============================================
     // PASSO 4: Aguardar autenticação por certificado
