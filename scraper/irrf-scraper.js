@@ -347,75 +347,106 @@ class ESocialIRRFScraper {
     ).catch(() => []);
     console.log('[Scraper] PASSO 3: Links <a> na página:', JSON.stringify(linksNaPagina));
 
-    // Tentar extrair href real do link "Seu certificado digital"
-    const certLinkHref = await this.page.evaluate(() => {
-      const texts = ['seu certificado digital', 'certificado digital'];
-      for (const a of document.querySelectorAll('a')) {
-        if (texts.some(t => (a.textContent || '').toLowerCase().includes(t))) {
-          const href = a.getAttribute('href');
-          if (href) return href;
+    // "Seu certificado digital" NÃO é um <a> link — é um elemento JS
+    // Usar TreeWalker para encontrar o texto exato e clicar no elemento correto
+
+    // Se estamos numa página 404 ou errada, voltar para a página de login
+    const urlAtualP3 = this.page.url();
+    if (!urlAtualP3.includes('sso.acesso.gov.br/login?') && authorizationId) {
+      const loginPageUrl = `https://sso.acesso.gov.br/login?client_id=login.esocial.gov.br&authorization_id=${authorizationId}`;
+      console.log('[Scraper] PASSO 3: Voltando para página de login:', loginPageUrl);
+      try {
+        await this.page.goto(loginPageUrl, { waitUntil: 'networkidle', timeout: 30000 });
+      } catch (e) {
+        console.log('[Scraper] PASSO 3: Aviso ao navegar para login:', e.message?.substring(0, 80));
+      }
+      await sleep(2000);
+    }
+
+    console.log('[Scraper] PASSO 3: URL antes de clicar cert:', this.page.url());
+
+    // Dump detalhado dos elementos com texto "certificado" para diagnóstico
+    const certButtonInfo = await this.page.evaluate(() => {
+      const results = [];
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      let node;
+      while ((node = walker.nextNode())) {
+        const text = node.textContent?.trim();
+        if (text?.toLowerCase().includes('certificado digital') || text?.toLowerCase().includes('seu certificado')) {
+          const parent = node.parentElement;
+          if (!parent) continue;
+          const rect = parent.getBoundingClientRect();
+          results.push({
+            text: text.substring(0, 60),
+            parentTag: parent.tagName,
+            parentClasses: parent.className?.substring(0, 60),
+            parentOnclick: parent.getAttribute('onclick'),
+            grandParentTag: parent.parentElement?.tagName,
+            grandParentClasses: parent.parentElement?.className?.substring(0, 60),
+            isVisible: rect.width > 0 && rect.height > 0
+          });
         }
       }
-      for (const btn of document.querySelectorAll('button, [role="button"], li')) {
-        if (texts.some(t => (btn.textContent || '').toLowerCase().includes(t))) {
-          const onclick = btn.getAttribute('onclick') || '';
-          const urlMatch = onclick.match(/location(?:\.href)?\s*=\s*['"]([^'"]+)['"]/);
-          if (urlMatch) return urlMatch[1];
-          const dataUrl = btn.getAttribute('data-href') || btn.getAttribute('data-url');
-          if (dataUrl) return dataUrl;
+      return results;
+    }).catch(() => []);
+    console.log('[Scraper] PASSO 3: Elementos "certificado digital":', JSON.stringify(certButtonInfo));
+
+    await this.page.screenshot({ path: '/tmp/esocial_03_antes_clique.png' });
+
+    // Clicar em "Seu certificado digital" usando TreeWalker (encontra texto exato)
+    // Playwright vai interceptar a navegação resultante e apresentar o cert via mTLS automaticamente
+    const clickResult = await this.page.evaluate(() => {
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      let node;
+      while ((node = walker.nextNode())) {
+        const text = node.textContent?.trim().toLowerCase();
+        if (text && (text === 'seu certificado digital' || text.includes('seu certificado digital'))) {
+          let clickTarget = node.parentElement;
+          // Subir na árvore até encontrar o melhor elemento clicável
+          for (let el = clickTarget; el && el.tagName !== 'BODY'; el = el.parentElement) {
+            if (el.tagName === 'A' || el.tagName === 'BUTTON' ||
+                el.getAttribute('onclick') || el.getAttribute('role') === 'button' ||
+                el.getAttribute('role') === 'link') {
+              clickTarget = el;
+              break;
+            }
+          }
+          clickTarget?.click();
+          return {
+            clicked: true,
+            text: node.textContent?.trim(),
+            tag: clickTarget?.tagName,
+            classes: clickTarget?.className?.substring(0, 60)
+          };
         }
       }
       return null;
-    }).catch(() => null);
-    console.log('[Scraper] PASSO 3: href do link certificado:', certLinkHref);
+    });
+    console.log('[Scraper] PASSO 3: Resultado do clique:', JSON.stringify(clickResult));
 
-    if (!authorizationId && !certLinkHref) {
-      await this.page.screenshot({ path: '/tmp/esocial_erro_sem_cert_url.png' });
-      throw new Error(`PASSO 3: authorization_id não encontrado e sem link certificado. URL atual: ${urlParaCert}`);
+    if (!clickResult) {
+      // Fallback: tentar via querySelector com textos conhecidos
+      const fallbackClicked = await this.page.evaluate(() => {
+        const texts = ['Seu certificado digital', 'certificado digital', 'certificado'];
+        for (const text of texts) {
+          const candidates = Array.from(document.querySelectorAll('*')).filter(el => {
+            const t = (el.textContent || '').trim();
+            const rect = el.getBoundingClientRect();
+            return el.children.length === 0 && t === text && rect.width > 0 && rect.height > 0;
+          });
+          if (candidates.length > 0) {
+            candidates[0].click();
+            return { clicked: true, text };
+          }
+        }
+        return null;
+      });
+      console.log('[Scraper] PASSO 3: Fallback clique:', JSON.stringify(fallbackClicked));
     }
 
-    // Construir lista de URLs candidatas para tentar (em ordem)
-    const certUrlCandidates = [
-      // 1. URL extraída do link real da página (mais confiável)
-      certLinkHref ? (certLinkHref.startsWith('http') ? certLinkHref : `https://sso.acesso.gov.br${certLinkHref.startsWith('/') ? '' : '/'}${certLinkHref}`) : null,
-      // 2. Endpoint padrão do gov.br
-      authorizationId ? `https://sso.acesso.gov.br/login/certificado?authorization_id=${authorizationId}` : null,
-      // 3. Variação sem "login/"
-      authorizationId ? `https://sso.acesso.gov.br/certificado?authorization_id=${authorizationId}` : null,
-    ].filter(Boolean);
-
-    console.log('[Scraper] PASSO 3: URLs candidatas a tentar:', JSON.stringify(certUrlCandidates));
-    await this.page.screenshot({ path: '/tmp/esocial_03_antes_cert_nav.png' });
-
-    let certAuthSuccess = false;
-    for (const certNavUrl of certUrlCandidates) {
-      console.log('[Scraper] PASSO 3: Navegando para:', certNavUrl);
-      try {
-        await this.page.goto(certNavUrl, { waitUntil: 'networkidle', timeout: 30000 });
-      } catch (navErr) {
-        console.log('[Scraper] PASSO 3: goto erro (pode ser redirect):', navErr.message?.substring(0, 100));
-      }
-      await sleep(2000);
-      const afterUrl = this.page.url();
-      const afterContent = await this.page.evaluate(() => document.body?.innerText?.substring(0, 200) || '').catch(() => '');
-      console.log('[Scraper] PASSO 3: URL após tentativa:', afterUrl);
-      console.log('[Scraper] PASSO 3: Conteúdo:', afterContent.replace(/\n+/g, ' | '));
-      await this.page.screenshot({ path: `/tmp/esocial_03_tentativa_${certUrlCandidates.indexOf(certNavUrl)}.png` });
-
-      if (!afterUrl.includes('sso.acesso.gov.br')) {
-        console.log('[Scraper] PASSO 3: ✓ Saiu do SSO! Login via cert completado.');
-        certAuthSuccess = true;
-        break;
-      }
-    }
-
-    if (certAuthSuccess) {
-      // Login já completado no PASSO 3 — pular PASSO 4
-      const finalUrl = this.page.url();
-      console.log('[Scraper] === LOGIN CONCLUÍDO COM SUCESSO (PASSO 3) ===');
-      console.log('[Scraper] URL final:', finalUrl);
-      return;
-    }
+    await sleep(2000);
+    console.log('[Scraper] PASSO 3: URL após clique:', this.page.url());
+    await this.page.screenshot({ path: '/tmp/esocial_03_apos_clique.png' });
 
     // ============================================
     // PASSO 4: Aguardar autenticação por certificado
@@ -443,11 +474,11 @@ class ESocialIRRFScraper {
         screenshotIdx++;
       }
 
-      const aindaNoLogin = currentUrl.includes('login.esocial.gov.br/login.aspx') ||
-                           currentUrl.includes('sso.acesso.gov.br/login') ||
-                           currentUrl.includes('sso.acesso.gov.br/authorize');
-      if (!aindaNoLogin) {
-        console.log('[Scraper] PASSO 4: ✓ Saiu do login! URL:', currentUrl);
+      // Considerar "ainda no login" qualquer página do SSO ou da tela de login do eSocial
+      const aindaNoLogin = currentUrl.includes('sso.acesso.gov.br') ||
+                           currentUrl.includes('login.esocial.gov.br/login.aspx');
+      if (!aindaNoLogin && currentUrl.includes('gov.br')) {
+        console.log('[Scraper] PASSO 4: ✓ Saiu do SSO! URL:', currentUrl);
         loginCompleted = true;
         break;
       }
@@ -478,11 +509,8 @@ class ESocialIRRFScraper {
       throw new Error(`Login não completado. Ainda na página de login. Erros: ${JSON.stringify(errorMsgs.slice(0, 3))}`);
     }
 
-    if (finalUrl.includes('sso.acesso.gov.br') && !finalUrl.includes('authorize')) {
-      const pageContent = await this.page.content();
-      if (pageContent.includes('Seu certificado') || pageContent.includes('senha')) {
-        throw new Error('Login não completado. Ainda na página do gov.br aguardando autenticação.');
-      }
+    if (finalUrl.includes('sso.acesso.gov.br')) {
+      throw new Error('Login não completado. Ainda no SSO do gov.br. URL: ' + finalUrl);
     }
 
     console.log('[Scraper] === LOGIN CONCLUÍDO COM SUCESSO ===');
