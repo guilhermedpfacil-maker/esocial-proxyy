@@ -176,149 +176,144 @@ class ESocialIRRFScraper {
   }
 
   async init() {
-    console.log('[Scraper] Initializing Puppeteer with NSS certificate support...');
-    
+    console.log('[Scraper] Inicializando Puppeteer com suporte a certificado...');
+
     const timestamp = Date.now();
-    
-    // 1. Salvar certificado PFX em arquivo temporário
+
+    // 1. Salvar PFX em arquivo temporário
     this.tempCertPath = path.join(os.tmpdir(), `cert_${timestamp}.pfx`);
-    const certBuffer = Buffer.from(this.certificatePfxBase64, 'base64');
-    fs.writeFileSync(this.tempCertPath, certBuffer);
-    console.log('[Scraper] Certificate saved to temp file');
+    fs.writeFileSync(this.tempCertPath, Buffer.from(this.certificatePfxBase64, 'base64'));
+    console.log('[Scraper] PFX salvo em:', this.tempCertPath);
 
-    // 2. Criar diretório NSS database temporário
-    this.tempNssDb = path.join(os.tmpdir(), `nssdb_${timestamp}`);
-    fs.mkdirSync(this.tempNssDb, { recursive: true });
-    console.log('[Scraper] NSS database directory created:', this.tempNssDb);
+    // 2. NSS database — Chrome no Linux lê de ~/.pki/nssdb (localização padrão do sistema)
+    //    Usar um diretório temporário exclusivo por sessão para evitar conflitos
+    const nssDb = path.join(os.tmpdir(), `nssdb_${timestamp}`);
+    fs.mkdirSync(nssDb, { recursive: true });
+    this.tempNssDb = nssDb;
+    console.log('[Scraper] NSS db:', nssDb);
 
-    // 3. Criar diretório userDataDir para o Chrome (separado do NSS)
-    this.tempUserDataDir = path.join(os.tmpdir(), `chrome_profile_${timestamp}`);
-    fs.mkdirSync(this.tempUserDataDir, { recursive: true });
-    
-    // Criar estrutura de diretórios necessária para NSS no Chrome
-    const nssDbInProfile = path.join(this.tempUserDataDir, 'nssdb');
-    fs.mkdirSync(nssDbInProfile, { recursive: true });
-    
     try {
-      // 4. Inicializar NSS database vazia
-      console.log('[Scraper] Initializing NSS database...');
-      execSync(`certutil -d sql:${nssDbInProfile} -N --empty-password`, { 
-        stdio: 'pipe',
-        timeout: 30000 
-      });
-      console.log('[Scraper] NSS database initialized');
+      // Inicializar NSS db vazia
+      execSync(`certutil -d sql:${nssDb} -N --empty-password`, { stdio: 'pipe', timeout: 30000 });
+      console.log('[Scraper] NSS db inicializado');
 
-      // 5. Importar certificado PFX no NSS database
-      console.log('[Scraper] Importing certificate into NSS database...');
-      
-      // Escapar senha para shell (substituir aspas simples)
-      const escapedPassword = this.password.replace(/'/g, "'\\''");
-      
-      execSync(`pk12util -d sql:${nssDbInProfile} -i "${this.tempCertPath}" -W '${escapedPassword}'`, {
-        stdio: 'pipe',
-        timeout: 30000
-      });
-      console.log('[Scraper] Certificate imported successfully');
-
-      // Listar certificados para confirmar importação
+      // Importar PFX
+      // Usar arquivo de senha para evitar problemas com caracteres especiais no shell
+      const passFile = path.join(os.tmpdir(), `pass_${timestamp}.txt`);
+      fs.writeFileSync(passFile, this.password);
       try {
-        const certList = execSync(`certutil -d sql:${nssDbInProfile} -L`, { 
-          encoding: 'utf-8',
-          timeout: 10000 
+        execSync(`pk12util -d sql:${nssDb} -i "${this.tempCertPath}" -w "${passFile}" -W ""`, {
+          stdio: 'pipe', timeout: 30000
         });
-        console.log('[Scraper] Certificates in NSS database:\n', certList);
-      } catch (e) {
-        console.log('[Scraper] Could not list certificates:', e.message);
+      } catch {
+        // Fallback: tentar com -W direto (para senhas simples)
+        const escapedPw = this.password.replace(/'/g, "'\\''");
+        execSync(`pk12util -d sql:${nssDb} -i "${this.tempCertPath}" -W '${escapedPw}'`, {
+          stdio: 'pipe', timeout: 30000
+        });
+      } finally {
+        try { fs.unlinkSync(passFile); } catch {}
       }
+      console.log('[Scraper] Certificado importado no NSS db');
 
-      // NOVO: Verificar se a chave privada foi importada (essencial para autenticação)
-      console.log('[Scraper] Verifying private key import...');
-      const passwordFilePath = path.join(os.tmpdir(), `nss_pass_${Date.now()}.txt`);
+      // Listar certificados para confirmar
+      const certList = execSync(`certutil -d sql:${nssDb} -L`, { encoding: 'utf-8', timeout: 10000 });
+      console.log('[Scraper] Certificados no NSS db:\n', certList);
+
+      // Extrair nickname do certificado importado para uso no auto-select
+      const firstLine = certList.split('\n').find(l => l.trim() && !l.includes('Certificate Nickname'));
+      this.certNickname = firstLine ? firstLine.split('  ')[0].trim() : '';
+      console.log('[Scraper] Nickname do certificado:', this.certNickname);
+
+      // Verificar chave privada
       try {
-        // Criar arquivo de senha temporário para certutil -K
-        fs.writeFileSync(passwordFilePath, '');  // NSS db usa empty password
-        
-        const keyList = execSync(`certutil -d sql:${nssDbInProfile} -K -f ${passwordFilePath}`, {
-          encoding: 'utf-8',
-          timeout: 10000
-        });
-        console.log('[Scraper] ✓ Private keys in NSS database:\n', keyList);
-        
-        // Limpar arquivo de senha
-        fs.unlinkSync(passwordFilePath);
+        const passFile2 = path.join(os.tmpdir(), `pass2_${timestamp}.txt`);
+        fs.writeFileSync(passFile2, '');
+        const keys = execSync(`certutil -d sql:${nssDb} -K -f "${passFile2}"`, { encoding: 'utf-8', timeout: 10000 });
+        fs.unlinkSync(passFile2);
+        console.log('[Scraper] Chaves privadas no NSS db:\n', keys);
       } catch (e) {
-        console.log('[Scraper] AVISO: Não foi possível listar chaves privadas:', e.message);
-        console.log('[Scraper] Isso pode indicar que a chave privada não foi importada corretamente');
-        console.log('[Scraper] O certificado pode não funcionar para autenticação mTLS');
-        
-        // Limpar arquivo de senha se existir
-        try { fs.unlinkSync(passwordFilePath); } catch {}
+        console.log('[Scraper] Aviso ao listar chaves:', e.message);
       }
 
     } catch (error) {
-      console.error('[Scraper] NSS setup error:', error.message);
-      console.error('[Scraper] Stderr:', error.stderr?.toString() || 'N/A');
-      
-      // Verificar se as ferramentas estão instaladas
-      try {
-        execSync('which certutil pk12util', { stdio: 'pipe' });
-      } catch {
-        throw new Error('libnss3-tools não está instalado. Execute: apt-get install -y libnss3-tools');
-      }
-      
-      throw new Error(`Falha ao configurar certificado NSS: ${error.message}`);
+      console.error('[Scraper] Erro ao configurar NSS:', error.message);
+      try { execSync('certutil --version && pk12util --version', { stdio: 'pipe' }); }
+      catch { throw new Error('libnss3-tools não instalado. Execute: apt-get install -y libnss3-tools'); }
+      throw new Error(`Falha ao importar certificado: ${error.message}`);
     }
 
-    // 6. Iniciar browser com NSS configurado (headless: false para popup de certificado)
-    console.log('[Scraper] Launching browser with certificate support...');
-    console.log('[Scraper] DISPLAY env:', process.env.DISPLAY);
-    
+    // 3. Copiar NSS db para ~/.pki/nssdb — localização que o Chrome no Linux usa nativamente
+    const pkiNssDb = path.join(os.homedir(), '.pki', 'nssdb');
+    fs.mkdirSync(path.join(os.homedir(), '.pki'), { recursive: true });
+    // Remover db anterior se existir e copiar o novo
+    if (fs.existsSync(pkiNssDb)) {
+      fs.rmSync(pkiNssDb, { recursive: true, force: true });
+    }
+    // Copiar arquivos do NSS db da sessão para ~/.pki/nssdb
+    fs.mkdirSync(pkiNssDb, { recursive: true });
+    for (const f of fs.readdirSync(nssDb)) {
+      fs.copyFileSync(path.join(nssDb, f), path.join(pkiNssDb, f));
+    }
+    console.log('[Scraper] NSS db copiado para ~/.pki/nssdb');
+    this.pkiNssDb = pkiNssDb;
+
+    // 4. Chrome userDataDir isolado por sessão
+    this.tempUserDataDir = path.join(os.tmpdir(), `chrome_${timestamp}`);
+    fs.mkdirSync(this.tempUserDataDir, { recursive: true });
+
+    // Construir a policy de auto-seleção de certificado
+    // FORMATO CORRETO: array JSON com pattern de URL — não usar "*" puro
+    const autoSelectPolicy = JSON.stringify([
+      { pattern: 'https://sso.acesso.gov.br', filter: {} },
+      { pattern: 'https://[*.]gov.br', filter: {} },
+      { pattern: 'https://[*.]esocial.gov.br', filter: {} }
+    ]);
+
+    console.log('[Scraper] Iniciando browser. DISPLAY:', process.env.DISPLAY);
+
     this.browser = await puppeteer.launch({
-      headless: false, // IMPORTANTE: false para permitir popup de certificado via Xvfb
+      headless: false, // false obrigatório para popup de certificado via Xvfb
       userDataDir: this.tempUserDataDir,
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
         '--disable-gpu',
         '--window-size=1920,1080',
-        '--display=' + (process.env.DISPLAY || ':99'), // Usar Xvfb display
-        // Ignorar erros de certificado do servidor (não do cliente)
         '--ignore-certificate-errors',
-        // Auto-selecionar certificado para QUALQUER URL que pedir certificado cliente
-        // IMPORTANTE: formato JSON é obrigatório - wildcards simples NÃO funcionam!
-        '--auto-select-certificate-for-urls={"pattern":"*","filter":{}}',
-        // Usar NSS database do perfil
+        '--ignore-certificate-errors-spki-list',
+        // CORREÇÃO PRINCIPAL: formato array JSON com URLs específicas do gov.br
+        `--auto-select-certificate-for-urls=${autoSelectPolicy}`,
+        // Apontar Chrome para o NSS db da sessão
+        `--use-system-default-printer`,
         '--allow-running-insecure-content',
       ],
+      env: {
+        ...process.env,
+        // Garantir que NSS_DEFAULT_DB_TYPE está definido para sql
+        NSS_DEFAULT_DB_TYPE: 'sql',
+        // Apontar para o NSS db da sessão via variável de ambiente do NSS
+        SSL_DIR: nssDb,
+      }
     });
 
     this.page = await this.browser.newPage();
-    
-    // Configurar viewport e user agent
     await this.page.setViewport({ width: 1920, height: 1080 });
-    await this.page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-    
-    // Timeout padrão
+    await this.page.setUserAgent(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    );
     this.page.setDefaultTimeout(30000);
     this.page.setDefaultNavigationTimeout(60000);
 
-    // Listener para requests de certificado cliente
-    this.page.on('request', request => {
-      if (request.url().includes('esocial.gov.br') || request.url().includes('gov.br')) {
-        console.log('[Scraper] Request to:', request.url());
-      }
-    });
-
-    // Listener para console do browser
     this.page.on('console', msg => {
-      if (msg.type() === 'error' || msg.text().toLowerCase().includes('certificate')) {
-        console.log('[Browser Console]', msg.text());
+      if (msg.type() === 'error' || msg.text().toLowerCase().includes('cert')) {
+        console.log('[Browser]', msg.text());
       }
     });
 
-    console.log('[Scraper] Browser initialized with certificate support');
+    console.log('[Scraper] Browser inicializado com suporte a certificado');
   }
 
   async login() {
@@ -1281,13 +1276,13 @@ class ESocialIRRFScraper {
       }
     }
     
-    // Limpar diretório NSS database
+    // Limpar NSS db temporário da sessão
     if (this.tempNssDb && fs.existsSync(this.tempNssDb)) {
       try {
         fs.rmSync(this.tempNssDb, { recursive: true, force: true });
-        console.log('[Scraper] Temp NSS database removed');
+        console.log('[Scraper] NSS db temporário removido');
       } catch (e) {
-        console.log('[Scraper] Could not remove temp NSS db:', e.message);
+        console.log('[Scraper] Não foi possível remover NSS db:', e.message);
       }
     }
     
