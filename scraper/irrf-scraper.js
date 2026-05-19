@@ -323,30 +323,32 @@ class ESocialIRRFScraper {
 
     // ============================================
     // PASSO 3: Navegar para endpoint de certificado
-    // NÃO clicar no elemento — navegar diretamente para /login/certificado
-    // para que o Playwright acione o mTLS via proxy local automaticamente
     // ============================================
     try { await this.page.waitForLoadState('domcontentloaded', { timeout: 10000 }); } catch {}
 
     const urlParaCert = this.page.url();
     console.log('[Scraper] PASSO 3: URL atual (SSO login):', urlParaCert);
 
+    // Dump TODOS os links da página para diagnóstico
+    const linksNaPagina = await this.page.$$eval('a', links =>
+      links.map(a => ({ text: a.textContent?.trim().substring(0, 60), href: a.getAttribute('href'), cls: a.className?.substring(0, 30) }))
+    ).catch(() => []);
+    console.log('[Scraper] PASSO 3: Todos os <a> na página:', JSON.stringify(linksNaPagina));
+
     // Extrair authorization_id da URL atual
     const authIdMatch = urlParaCert.match(/authorization_id=([^&]+)/);
     const authorizationId = authIdMatch ? authIdMatch[1] : null;
     console.log('[Scraper] PASSO 3: authorization_id:', authorizationId);
 
-    // Tentar extrair href real do link "Seu certificado digital" na página
+    // Tentar extrair href real do link "Seu certificado digital"
     const certLinkHref = await this.page.evaluate(() => {
       const texts = ['seu certificado digital', 'certificado digital'];
-      // Prioridade: links <a> com href
       for (const a of document.querySelectorAll('a')) {
         if (texts.some(t => (a.textContent || '').toLowerCase().includes(t))) {
           const href = a.getAttribute('href');
           if (href) return href;
         }
       }
-      // Botões com onclick ou data-url
       for (const btn of document.querySelectorAll('button, [role="button"], li')) {
         if (texts.some(t => (btn.textContent || '').toLowerCase().includes(t))) {
           const onclick = btn.getAttribute('onclick') || '';
@@ -360,34 +362,53 @@ class ESocialIRRFScraper {
     }).catch(() => null);
     console.log('[Scraper] PASSO 3: href do link certificado:', certLinkHref);
 
-    // Construir URL de destino para o endpoint mTLS
-    let certNavUrl = null;
-    if (certLinkHref) {
-      certNavUrl = certLinkHref.startsWith('http')
-        ? certLinkHref
-        : `https://sso.acesso.gov.br${certLinkHref.startsWith('/') ? '' : '/'}${certLinkHref}`;
-    } else if (authorizationId) {
-      // URL padrão do gov.br para autenticação por certificado
-      certNavUrl = `https://sso.acesso.gov.br/login/certificado?authorization_id=${authorizationId}`;
-    }
-
-    if (!certNavUrl) {
+    if (!authorizationId && !certLinkHref) {
       await this.page.screenshot({ path: '/tmp/esocial_erro_sem_cert_url.png' });
-      throw new Error('PASSO 3: não foi possível determinar URL do endpoint de certificado');
+      throw new Error('PASSO 3: authorization_id não encontrado na URL e sem link certificado');
     }
 
-    console.log('[Scraper] PASSO 3: Navegando diretamente para endpoint mTLS:', certNavUrl);
+    // Construir lista de URLs candidatas para tentar (em ordem)
+    const certUrlCandidates = [
+      // 1. URL extraída do link real da página (mais confiável)
+      certLinkHref ? (certLinkHref.startsWith('http') ? certLinkHref : `https://sso.acesso.gov.br${certLinkHref.startsWith('/') ? '' : '/'}${certLinkHref}`) : null,
+      // 2. Endpoint padrão do gov.br
+      authorizationId ? `https://sso.acesso.gov.br/login/certificado?authorization_id=${authorizationId}` : null,
+      // 3. Variação sem "login/"
+      authorizationId ? `https://sso.acesso.gov.br/certificado?authorization_id=${authorizationId}` : null,
+    ].filter(Boolean);
+
+    console.log('[Scraper] PASSO 3: URLs candidatas a tentar:', JSON.stringify(certUrlCandidates));
     await this.page.screenshot({ path: '/tmp/esocial_03_antes_cert_nav.png' });
 
-    // Navegar — Playwright apresenta o certificado automaticamente no handshake TLS
-    try {
-      await this.page.goto(certNavUrl, { waitUntil: 'commit', timeout: 30000 });
-    } catch (navErr) {
-      // 'commit' pode lançar se a resposta for um redirect imediato — isso é esperado
-      console.log('[Scraper] PASSO 3: goto retornou (pode ser redirect):', navErr.message?.substring(0, 80));
+    let certAuthSuccess = false;
+    for (const certNavUrl of certUrlCandidates) {
+      console.log('[Scraper] PASSO 3: Navegando para:', certNavUrl);
+      try {
+        await this.page.goto(certNavUrl, { waitUntil: 'networkidle', timeout: 30000 });
+      } catch (navErr) {
+        console.log('[Scraper] PASSO 3: goto erro (pode ser redirect):', navErr.message?.substring(0, 100));
+      }
+      await sleep(2000);
+      const afterUrl = this.page.url();
+      const afterContent = await this.page.evaluate(() => document.body?.innerText?.substring(0, 200) || '').catch(() => '');
+      console.log('[Scraper] PASSO 3: URL após tentativa:', afterUrl);
+      console.log('[Scraper] PASSO 3: Conteúdo:', afterContent.replace(/\n+/g, ' | '));
+      await this.page.screenshot({ path: `/tmp/esocial_03_tentativa_${certUrlCandidates.indexOf(certNavUrl)}.png` });
+
+      if (!afterUrl.includes('sso.acesso.gov.br')) {
+        console.log('[Scraper] PASSO 3: ✓ Saiu do SSO! Login via cert completado.');
+        certAuthSuccess = true;
+        break;
+      }
     }
-    await sleep(2000);
-    console.log('[Scraper] PASSO 3: URL após navegar para cert endpoint:', this.page.url());
+
+    if (certAuthSuccess) {
+      // Login já completado no PASSO 3 — pular PASSO 4
+      const finalUrl = this.page.url();
+      console.log('[Scraper] === LOGIN CONCLUÍDO COM SUCESSO (PASSO 3) ===');
+      console.log('[Scraper] URL final:', finalUrl);
+      return;
+    }
 
     // ============================================
     // PASSO 4: Aguardar autenticação por certificado
