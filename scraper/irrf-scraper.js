@@ -6,7 +6,7 @@
  */
 
 // ========== VERSÃO DO SCRAPER ==========
-const SCRAPER_VERSION = 'v2.1.0-sso-fix-2024-12-31';
+const SCRAPER_VERSION = 'v2.2.0-download-fix-2025';
 
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
@@ -850,210 +850,312 @@ class ESocialIRRFScraper {
   }
 
   async navigateToIRRF() {
-    console.log('[Scraper] Navigating to IRRF por trabalhador...');
-    
+    console.log('[Scraper] Navegando para IRRF por trabalhador...');
+
+    const clickMenuItem = async (texts, stepName) => {
+      for (const text of texts) {
+        const clicked = await this.page.evaluate((text) => {
+          const candidates = Array.from(document.querySelectorAll('a, button, li, span, div[role="menuitem"]'));
+          const match = candidates.find(el => {
+            const t = (el.textContent || '').trim().toLowerCase();
+            const rect = el.getBoundingClientRect();
+            return t.includes(text.toLowerCase()) && rect.width > 0 && rect.height > 0;
+          });
+          if (match) { match.click(); return true; }
+          return false;
+        }, text);
+        if (clicked) {
+          console.log(`[Scraper] ${stepName}: clicou em "${text}"`);
+          return true;
+        }
+      }
+      return false;
+    };
+
     try {
-      // Menu: Folha de Pagamento
-      let menuClicked = false;
-      try {
-        await this.page.waitForSelector(SELECTORS.menuFolhaPagamento, { timeout: 5000 });
-        await this.page.click(SELECTORS.menuFolhaPagamento);
-        menuClicked = true;
-      } catch {
-        menuClicked = await clickByText(this.page, 'Folha de Pagamento', 'a, button, li, span');
-      }
-      await sleep(1000);
-      
-      // Submenu: Totalizadores
-      try {
-        await this.page.waitForSelector(SELECTORS.submenuTotalizadores, { timeout: 5000 });
-        await this.page.click(SELECTORS.submenuTotalizadores);
-      } catch {
-        await clickByText(this.page, 'Totalizadores', 'a, button, li, span');
-      }
-      await sleep(1000);
-      
-      // Submenu: Trabalhador
-      try {
-        await this.page.waitForSelector(SELECTORS.submenuTrabalhador, { timeout: 5000 });
-        await this.page.click(SELECTORS.submenuTrabalhador);
-      } catch {
-        await clickByText(this.page, 'Trabalhador', 'a, button, li, span');
-      }
-      await sleep(1000);
-      
-      // Opção: IRRF por trabalhador
-      try {
-        await this.page.waitForSelector(SELECTORS.optionIRRF, { timeout: 5000 });
-        await this.page.click(SELECTORS.optionIRRF);
-      } catch {
-        await clickByText(this.page, 'IRRF', 'a, button, li, span');
-      }
+      await this.page.screenshot({ path: '/tmp/esocial_nav_00_logado.png' });
+
+      // Passo 1: Folha de Pagamento
+      const fp = await clickMenuItem(['Folha de Pagamento', 'Folha Pagamento', 'Folha'], 'Menu Folha');
+      if (!fp) throw new Error('Menu "Folha de Pagamento" não encontrado');
+      await sleep(1500);
+      await this.page.screenshot({ path: '/tmp/esocial_nav_01_folha.png' });
+
+      // Passo 2: Totalizadores
+      const tot = await clickMenuItem(['Totalizadores', 'Totalizador'], 'Submenu Totalizadores');
+      if (!tot) throw new Error('Submenu "Totalizadores" não encontrado');
+      await sleep(1500);
+      await this.page.screenshot({ path: '/tmp/esocial_nav_02_totalizadores.png' });
+
+      // Passo 3: Trabalhador
+      const trab = await clickMenuItem(['Trabalhador'], 'Submenu Trabalhador');
+      if (!trab) throw new Error('Submenu "Trabalhador" não encontrado');
+      await sleep(1500);
+      await this.page.screenshot({ path: '/tmp/esocial_nav_03_trabalhador.png' });
+
+      // Passo 4: IRRF por trabalhador
+      const irrf = await clickMenuItem(['IRRF por Trabalhador', 'IRRF por trabalhador', 'IRRF'], 'Opção IRRF');
+      if (!irrf) throw new Error('Opção "IRRF por Trabalhador" não encontrada');
       await sleep(2000);
-      
-      console.log('[Scraper] Navigated to IRRF form');
+      await this.page.screenshot({ path: '/tmp/esocial_nav_04_irrf.png' });
+
+      // Aguardar formulário carregar e salvar URL para re-uso entre consultas
+      await this.page.waitForFunction(
+        () => document.querySelectorAll('input').length > 0,
+        { timeout: 15000 }
+      );
+
+      this.irrfFormUrl = this.page.url();
+      console.log(`[Scraper] Formulário IRRF carregado. URL: ${this.irrfFormUrl}`);
       await debugDumpInputs(this.page, 'irrf_form');
-      
+
     } catch (error) {
-      console.error('[Scraper] Navigation error:', error.message);
+      console.error('[Scraper] Erro na navegação:', error.message);
       await this.page.screenshot({ path: '/tmp/esocial_nav_error.png' });
-      throw new Error(`Falha na navegação: ${error.message}`);
+      throw new Error(`Falha na navegação ao menu IRRF: ${error.message}`);
     }
   }
 
+  async voltarAoFormulario() {
+    // Primeira tentativa: botão Voltar
+    const voltarClicked = await this.page.evaluate(() => {
+      const candidates = Array.from(document.querySelectorAll('button, a'));
+      const voltar = candidates.find(el => {
+        const t = (el.textContent || '').trim().toLowerCase();
+        return t === 'voltar' || t.includes('nova consulta') || t.includes('nova pesquisa');
+      });
+      if (voltar) { voltar.click(); return true; }
+      return false;
+    });
+
+    if (voltarClicked) {
+      await sleep(1500);
+      return;
+    }
+
+    // Segunda tentativa: navegar para URL salva do formulário
+    if (this.irrfFormUrl) {
+      await this.page.goto(this.irrfFormUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+      await sleep(1500);
+      return;
+    }
+
+    // Última tentativa: re-navegar pelo menu
+    await this.navigateToIRRF();
+  }
+
   async consultarIRRF(cpf, periodo) {
-    console.log(`[Scraper] Consulting IRRF for CPF ${cpf}, period ${periodo}...`);
-    
+    const cpfClean = cpf.replace(/\D/g, '');
+    const periodoFormatado = this.formatPeriodo(periodo);
+    const cpfFormatado = this.formatCPF(cpf);
+
+    console.log(`[Scraper] Consultando CPF ${cpfFormatado} - Período ${periodoFormatado}...`);
+
     try {
-      // Limpar campos anteriores (mantém simples: limpar inputs visíveis)
+      // Limpar campos de texto visíveis
       await this.page.evaluate(() => {
-        const inputs = document.querySelectorAll('input');
-        inputs.forEach((input) => {
-          if (input.type && ['hidden', 'submit', 'button', 'checkbox', 'radio', 'file'].includes(input.type)) return;
-          try { input.value = ''; } catch {}
+        const skip = new Set(['hidden', 'submit', 'button', 'checkbox', 'radio', 'file', 'image']);
+        document.querySelectorAll('input').forEach(el => {
+          if (!skip.has((el.type || '').toLowerCase())) {
+            try { el.value = ''; } catch {}
+          }
         });
       });
 
-      const periodoFormatado = this.formatPeriodo(periodo);
-      const cpfFormatado = this.formatCPF(cpf);
-
-      // Encontrar campo Período (selector -> label -> fallback por posição)
+      // ---- Localizar campo Período ----
       let periodoEl = await this.page.$(SELECTORS.inputPeriodo);
       if (!periodoEl) periodoEl = await findInputHandleByLabel(this.page, 'Período');
       if (!periodoEl) periodoEl = await findInputHandleByLabel(this.page, 'Periodo');
       if (!periodoEl) periodoEl = await findInputHandleByLabel(this.page, 'Compet');
+      if (!periodoEl) periodoEl = await findInputHandleByLabel(this.page, 'Mês');
 
-      // Encontrar campo CPF (selector -> label -> fallback por posição)
+      // ---- Localizar campo CPF ----
       let cpfEl = await this.page.$(SELECTORS.inputCPF);
       if (!cpfEl) cpfEl = await findInputHandleByLabel(this.page, 'CPF');
+      if (!cpfEl) cpfEl = await findInputHandleByLabel(this.page, 'Trabalhador');
 
-      // Fallback final: usar 1º e 2º inputs de texto visíveis
+      // Fallback por posição: 1º e 2º inputs de texto visíveis
       if (!periodoEl || !cpfEl) {
-        const visibleTextInputs = await getVisibleTextInputs(this.page);
-        if (!periodoEl) periodoEl = visibleTextInputs[0] || null;
-        if (!cpfEl) cpfEl = visibleTextInputs[1] || null;
+        const visibles = await getVisibleTextInputs(this.page);
+        if (!periodoEl) periodoEl = visibles[0] || null;
+        if (!cpfEl)     cpfEl     = visibles[1] || null;
       }
 
       if (!periodoEl || !cpfEl) {
-        await debugDumpInputs(this.page, 'irrf_missing_fields');
-        throw new Error('Não foi possível localizar os campos de Período e/ou CPF no formulário');
+        await debugDumpInputs(this.page, `missing_fields_${cpfClean}_${periodo}`);
+        throw new Error('Campos de Período e/ou CPF não encontrados no formulário');
       }
 
-      // Preencher período (formato MM/YYYY)
+      // ---- Preencher Período ----
       await periodoEl.click({ clickCount: 3 });
-      await this.page.keyboard.type(periodoFormatado, { delay: 50 });
+      await periodoEl.type(periodoFormatado, { delay: 60 });
+      console.log(`[Scraper] Período preenchido: ${periodoFormatado}`);
 
-      // Preencher CPF (formato XXX.XXX.XXX-XX)
+      // ---- Preencher CPF ----
       await cpfEl.click({ clickCount: 3 });
-      await this.page.keyboard.type(cpfFormatado, { delay: 50 });
+      await cpfEl.type(cpfFormatado, { delay: 60 });
+      console.log(`[Scraper] CPF preenchido: ${cpfFormatado}`);
 
-      // Clicar em Pesquisar - tentar CSS primeiro, depois texto
-      let searchClicked = false;
-      try {
-        const btnPesquisar = await this.page.$(SELECTORS.btnPesquisar);
-        if (btnPesquisar) {
-          await btnPesquisar.click();
-          searchClicked = true;
-        }
-      } catch {}
-      
+      await this.page.screenshot({ path: `/tmp/esocial_consulta_${cpfClean}_preenchido.png` });
+
+      // ---- Clicar em Pesquisar ----
+      const searchClicked = await this.page.evaluate(() => {
+        const texts = ['pesquisar', 'consultar', 'buscar', 'pesquisa', 'search'];
+        const candidates = Array.from(document.querySelectorAll('button, input[type="submit"], a'));
+        const match = candidates.find(el => {
+          const t = (el.textContent || el.value || '').trim().toLowerCase();
+          return texts.some(s => t.includes(s));
+        });
+        if (match) { match.click(); return true; }
+        return false;
+      });
+
       if (!searchClicked) {
-        searchClicked = await clickByText(this.page, 'Pesquisar', 'button, input[type="submit"], a');
+        // Fallback: Enter no campo CPF
+        await cpfEl.press('Enter');
       }
 
-      // Aguardar resultado (pode ser tabela de dados ou mensagem de sem dados)
+      // Aguardar resultado aparecer (tabela, mensagem de sem dados ou erro)
       await sleep(3000);
+      await this.page.screenshot({ path: `/tmp/esocial_consulta_${cpfClean}_resultado.png` });
 
-      // Verificar se há mensagem de "sem dados"
-      const semDados = await this.page.$(SELECTORS.msgSemDados);
-      if (semDados) {
-        console.log(`[Scraper] No data found for ${cpf} - ${periodo}`);
-        return { cpf, periodo, success: false, message: 'Sem dados para o período' };
+      // ---- Detectar "sem dados" ou erro ----
+      const paginaTexto = await this.page.evaluate(() => document.body?.innerText || '');
+      const semDadosTextos = [
+        'sem dados', 'nenhum registro', 'não encontrado', 'nao encontrado',
+        'no records', 'no data', 'sem informação', 'nenhuma informação'
+      ];
+      const ehSemDados = semDadosTextos.some(t => paginaTexto.toLowerCase().includes(t));
+
+      if (ehSemDados) {
+        console.log(`[Scraper] Sem dados para CPF ${cpfFormatado} - ${periodoFormatado}`);
+        return { cpf, periodo, success: false, message: 'Sem dados para o período informado' };
       }
 
-      // Verificar se há mensagem de erro
-      const erro = await this.page.$(SELECTORS.msgErro);
-      if (erro) {
-        const msgErro = await this.page.evaluate(el => el.textContent, erro);
-        console.log(`[Scraper] Error for ${cpf} - ${periodo}: ${msgErro}`);
-        return { cpf, periodo, success: false, error: msgErro };
-      }
-
-      // Tentar baixar XML
+      // ---- Tentar baixar XML ----
       const xmlContent = await this.downloadXML();
 
       if (xmlContent) {
-        console.log(`[Scraper] XML downloaded for ${cpf} - ${periodo}`);
+        console.log(`[Scraper] XML baixado com sucesso para ${cpfFormatado} - ${periodoFormatado} (${xmlContent.length} bytes)`);
         return { cpf, periodo, success: true, xml: xmlContent };
       }
 
-      // Se não conseguir baixar XML, extrair dados da tela
+      // Fallback: extrair dados da tela
       const dadosTela = await this.extractDataFromScreen();
+      const temDados = dadosTela && Object.keys(dadosTela).length > 0;
 
       return {
         cpf,
         periodo,
-        success: true,
-        dados: dadosTela
+        success: temDados,
+        dados: dadosTela,
+        message: temDados ? 'Dados extraídos da tela (XML não disponível)' : 'Nenhum dado encontrado'
       };
-      
+
     } catch (error) {
-      console.error(`[Scraper] Consultation error for ${cpf} - ${periodo}:`, error.message);
-      await this.page.screenshot({ path: `/tmp/esocial_error_${cpf}_${periodo}.png` });
+      console.error(`[Scraper] Erro na consulta ${cpf} - ${periodo}:`, error.message);
+      await this.page.screenshot({ path: `/tmp/esocial_erro_${cpfClean}_${periodo}.png` });
       return { cpf, periodo, success: false, error: error.message };
     }
   }
 
   async downloadXML() {
-    try {
-      // Tentar encontrar botão de download por CSS
-      let downloadButton = await this.page.$(SELECTORS.btnBaixarXML);
-      
-      // Se não encontrar, tentar por texto
-      if (!downloadButton) {
-        const clicked = await clickByText(this.page, 'Baixar XML', 'button, a');
-        if (clicked) {
-          await sleep(3000);
-          // Ler arquivo baixado
-          const files = fs.readdirSync(os.tmpdir())
-            .filter(f => f.endsWith('.xml') && f.includes('S-5002'));
-          
-          if (files.length > 0) {
-            const latestFile = files.sort().pop();
-            const xmlPath = path.join(os.tmpdir(), latestFile);
-            const xmlContent = fs.readFileSync(xmlPath, 'utf-8');
-            fs.unlinkSync(xmlPath);
-            return xmlContent;
-          }
-        }
-        return null;
-      }
+    // Diretório exclusivo para este download (evita conflitos entre consultas paralelas)
+    const downloadDir = path.join(os.tmpdir(), `esocial_dl_${Date.now()}`);
+    fs.mkdirSync(downloadDir, { recursive: true });
 
-      // Configurar interceptação de download
+    try {
+      // Configurar CDP para capturar downloads ANTES de clicar
       const client = await this.page.target().createCDPSession();
       await client.send('Page.setDownloadBehavior', {
         behavior: 'allow',
-        downloadPath: os.tmpdir()
+        downloadPath: downloadDir
       });
 
-      await downloadButton.click();
-      await sleep(3000);
+      // Procurar botão de download XML por texto (múltiplas variações)
+      const downloadTexts = [
+        'Baixar XML', 'Download XML', 'XML', 'Baixar', 'Download',
+        'baixar xml', 'download xml', 'xml', 'baixar', 'download'
+      ];
 
-      // Tentar ler o arquivo XML baixado
-      const files = fs.readdirSync(os.tmpdir())
-        .filter(f => f.endsWith('.xml') && f.includes('S-5002'));
-      
-      if (files.length > 0) {
-        const latestFile = files.sort().pop();
-        const xmlPath = path.join(os.tmpdir(), latestFile);
-        const xmlContent = fs.readFileSync(xmlPath, 'utf-8');
-        fs.unlinkSync(xmlPath); // Limpar arquivo temporário
-        return xmlContent;
+      let downloadClicked = false;
+      for (const text of downloadTexts) {
+        const clicked = await this.page.evaluate((text) => {
+          const candidates = Array.from(document.querySelectorAll('button, a, input[type="button"]'));
+          const match = candidates.find(el => {
+            const t = (el.textContent || el.value || '').trim().toLowerCase();
+            const rect = el.getBoundingClientRect();
+            return t.includes(text.toLowerCase()) && rect.width > 0 && rect.height > 0;
+          });
+          if (match) { match.click(); return true; }
+          return false;
+        }, text);
+
+        if (clicked) {
+          console.log(`[Scraper] Download: clicou em botão "${text}"`);
+          downloadClicked = true;
+          break;
+        }
       }
 
+      // Fallback: clicar em links com href que contenham xml ou download
+      if (!downloadClicked) {
+        downloadClicked = await this.page.evaluate(() => {
+          const links = Array.from(document.querySelectorAll('a[href]'));
+          const match = links.find(a => {
+            const href = (a.getAttribute('href') || '').toLowerCase();
+            return href.includes('xml') || href.includes('download');
+          });
+          if (match) { match.click(); return true; }
+          return false;
+        });
+        if (downloadClicked) console.log('[Scraper] Download: clicou em link com href xml/download');
+      }
+
+      if (!downloadClicked) {
+        console.log('[Scraper] Download: nenhum botão de download XML encontrado');
+        fs.rmSync(downloadDir, { recursive: true, force: true });
+        return null;
+      }
+
+      // Aguardar arquivo aparecer no diretório de download (polling até 20s)
+      const maxWaitMs = 20000;
+      const startTime = Date.now();
+
+      while (Date.now() - startTime < maxWaitMs) {
+        await sleep(500);
+
+        let files;
+        try { files = fs.readdirSync(downloadDir); } catch { continue; }
+
+        // Ignorar arquivos .crdownload (download ainda em progresso)
+        const completed = files.filter(f => !f.endsWith('.crdownload') && !f.endsWith('.tmp'));
+        const inProgress = files.filter(f => f.endsWith('.crdownload'));
+
+        if (completed.length > 0 && inProgress.length === 0) {
+          // Preferir arquivos XML; se não houver, pegar o primeiro
+          const xmlFiles = completed.filter(f => f.toLowerCase().endsWith('.xml'));
+          const target = xmlFiles[0] || completed[0];
+          const filePath = path.join(downloadDir, target);
+
+          try {
+            const content = fs.readFileSync(filePath, 'utf-8');
+            console.log(`[Scraper] Download: arquivo "${target}" lido (${content.length} bytes)`);
+            fs.rmSync(downloadDir, { recursive: true, force: true });
+            return content;
+          } catch (readErr) {
+            console.log('[Scraper] Download: erro ao ler arquivo:', readErr.message);
+          }
+        }
+      }
+
+      console.log('[Scraper] Download: timeout aguardando arquivo');
+      fs.rmSync(downloadDir, { recursive: true, force: true });
       return null;
+
     } catch (error) {
-      console.error('[Scraper] XML download error:', error.message);
+      console.error('[Scraper] Erro no download XML:', error.message);
+      try { fs.rmSync(downloadDir, { recursive: true, force: true }); } catch {}
       return null;
     }
   }
@@ -1103,52 +1205,47 @@ class ESocialIRRFScraper {
   async processMultiple(cpfs, periodos) {
     const results = [];
     let loginDone = false;
-    
+
     try {
       await this.init();
       await this.login();
       loginDone = true;
       await this.navigateToIRRF();
-      
+
+      const total = cpfs.length * periodos.length;
+      let done = 0;
+
       for (const periodo of periodos) {
         for (const cpf of cpfs) {
+          done++;
+          console.log(`[Scraper] [${done}/${total}] Consultando CPF ${cpf} - Período ${periodo}...`);
+
           try {
             const result = await this.consultarIRRF(cpf, periodo);
             results.push(result);
-            console.log(`[Scraper] ✓ ${cpf} - ${periodo}: ${result.success ? 'OK' : 'FALHA'}`);
-            
-            // Clicar em Voltar para nova consulta (se necessário)
-            let voltarClicked = false;
-            try {
-              const btnVoltar = await this.page.$(SELECTORS.btnVoltar);
-              if (btnVoltar) {
-                await btnVoltar.click();
-                voltarClicked = true;
-              }
-            } catch {}
-            
-            if (!voltarClicked) {
-              await clickByText(this.page, 'Voltar', 'button, a');
-            }
-            await sleep(1000);
-            
+            console.log(`[Scraper] [${done}/${total}] ${result.success ? '✓ OK' : '✗ FALHA'}: ${cpf} - ${periodo}`);
           } catch (error) {
-            console.error(`[Scraper] ✗ ${cpf} - ${periodo}: ${error.message}`);
+            console.error(`[Scraper] [${done}/${total}] ✗ ERRO: ${cpf} - ${periodo}: ${error.message}`);
             results.push({ cpf, periodo, success: false, error: error.message });
           }
-          
-          // Delay entre consultas para evitar bloqueio
-          await sleep(2000);
+
+          // Voltar ao formulário para próxima consulta (exceto na última)
+          if (done < total) {
+            try {
+              await this.voltarAoFormulario();
+            } catch (navErr) {
+              console.log('[Scraper] Aviso ao voltar ao formulário:', navErr.message);
+            }
+            await sleep(1500);
+          }
         }
       }
-      
+
     } catch (error) {
-      console.error('[Scraper] Process error:', error.message);
-      if (!loginDone) {
-        throw error;
-      }
+      console.error('[Scraper] Erro geral:', error.message);
+      if (!loginDone) throw error;
     }
-    
+
     return results;
   }
 
