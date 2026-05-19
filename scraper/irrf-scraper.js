@@ -268,7 +268,7 @@ class ESocialIRRFScraper {
       throw new Error('PASSO 2 falhou: Nenhum link para SSO encontrado');
     }
 
-    console.log('[Scraper] PASSO 2: Clicou (método:', govBrClicked.method, '). Aguardando navegação...');
+    console.log('[Scraper] PASSO 2: Clicou (método:', govBrClicked.method, '). Aguardando redirect para /login?authorization_id=...');
 
     // Detectar nova aba SSO
     let newPageOpened = false;
@@ -291,35 +291,46 @@ class ESocialIRRFScraper {
       }
     }
 
-    // Aguardar a página estabilizar (o /authorize redireciona para /login?authorization_id=... automaticamente)
-    // Precisamos esperar até o authorization_id aparecer na URL antes de continuar
-    try {
-      await this.page.waitForURL(url => url.includes('authorization_id='), { timeout: 30000 });
-      console.log('[Scraper] PASSO 2: URL com authorization_id:', this.page.url());
-    } catch {
-      // Se não apareceu o authorization_id, aguardar networkidle como fallback
-      try { await this.page.waitForLoadState('networkidle', { timeout: 15000 }); } catch {}
+    // Polling para aguardar o redirect de /authorize para /login?authorization_id=...
+    // Mais robusto que waitForURL que pode falhar com "Execution context destroyed"
+    let authorizationId = null;
+    const pollStart = Date.now();
+    const pollTimeout = 60000; // 60 segundos
+    while (Date.now() - pollStart < pollTimeout) {
+      await sleep(1000);
+      let currentUrl = '';
+      try { currentUrl = this.page.url(); } catch { await sleep(1000); continue; }
+      const elapsedPoll = Math.round((Date.now() - pollStart) / 1000);
+      if (elapsedPoll % 5 === 0 || elapsedPoll < 5) {
+        console.log(`[Scraper] PASSO 2 [${elapsedPoll}s]: ${currentUrl.substring(0, 120)}`);
+      }
+      const match = currentUrl.match(/authorization_id=([^&]+)/);
+      if (match) {
+        authorizationId = match[1];
+        console.log('[Scraper] PASSO 2: ✓ authorization_id encontrado:', authorizationId);
+        console.log('[Scraper] PASSO 2: URL com authorization_id:', currentUrl);
+        break;
+      }
+      // Se já saiu do SSO completamente (raro mas possível com cert já cacheado)
+      if (!currentUrl.includes('sso.acesso.gov.br') && !currentUrl.includes('login.esocial.gov.br/login.aspx') && currentUrl.includes('gov.br')) {
+        console.log('[Scraper] PASSO 2: ✓ Saiu do SSO diretamente! URL:', currentUrl);
+        console.log('[Scraper] === LOGIN CONCLUÍDO (PASSO 2) ===');
+        return;
+      }
     }
-    await sleep(1000);
 
     await this.page.screenshot({ path: '/tmp/esocial_02_pagina_apos_clique.png' });
     const urlAposClique = this.page.url();
-    console.log('[Scraper] PASSO 2: URL após clique:', urlAposClique);
+    console.log('[Scraper] PASSO 2: URL final após polling:', urlAposClique);
 
     const isPortalGenerico = urlAposClique.includes('www.gov.br') && !urlAposClique.includes('sso.acesso');
     if (isPortalGenerico) {
       throw new Error(`PASSO 2 FALHOU: Redirecionou para portal genérico (${urlAposClique})`);
     }
 
-    let buttons2 = [];
-    try {
-      buttons2 = await this.page.$$eval('a, button, [role="button"], li, [class*="card"]', els =>
-        els.map(el => ({ tag: el.tagName, text: el.textContent?.trim().substring(0, 50), classes: el.className?.substring?.(0, 30) || '' })).filter(e => e.text)
-      );
-    } catch (e) {
-      console.log('[Scraper] PASSO 2: Aviso ao listar elementos:', e.message);
+    if (!authorizationId) {
+      console.log('[Scraper] PASSO 2: AVISO - authorization_id não encontrado após 60s. URL:', urlAposClique);
     }
-    console.log('[Scraper] PASSO 2: Elementos disponíveis:', JSON.stringify(buttons2.slice(0, 15), null, 2));
 
     // ============================================
     // PASSO 3: Navegar para endpoint de certificado
@@ -327,18 +338,14 @@ class ESocialIRRFScraper {
     try { await this.page.waitForLoadState('domcontentloaded', { timeout: 10000 }); } catch {}
 
     const urlParaCert = this.page.url();
-    console.log('[Scraper] PASSO 3: URL atual (SSO login):', urlParaCert);
+    console.log('[Scraper] PASSO 3: URL atual:', urlParaCert);
+    console.log('[Scraper] PASSO 3: authorization_id (do PASSO 2):', authorizationId);
 
-    // Dump TODOS os links da página para diagnóstico
+    // Dump todos os links visíveis para diagnóstico
     const linksNaPagina = await this.page.$$eval('a', links =>
-      links.map(a => ({ text: a.textContent?.trim().substring(0, 60), href: a.getAttribute('href'), cls: a.className?.substring(0, 30) }))
+      links.map(a => ({ text: a.textContent?.trim().substring(0, 60), href: a.getAttribute('href') }))
     ).catch(() => []);
-    console.log('[Scraper] PASSO 3: Todos os <a> na página:', JSON.stringify(linksNaPagina));
-
-    // Extrair authorization_id da URL atual
-    const authIdMatch = urlParaCert.match(/authorization_id=([^&]+)/);
-    const authorizationId = authIdMatch ? authIdMatch[1] : null;
-    console.log('[Scraper] PASSO 3: authorization_id:', authorizationId);
+    console.log('[Scraper] PASSO 3: Links <a> na página:', JSON.stringify(linksNaPagina));
 
     // Tentar extrair href real do link "Seu certificado digital"
     const certLinkHref = await this.page.evaluate(() => {
@@ -364,7 +371,7 @@ class ESocialIRRFScraper {
 
     if (!authorizationId && !certLinkHref) {
       await this.page.screenshot({ path: '/tmp/esocial_erro_sem_cert_url.png' });
-      throw new Error('PASSO 3: authorization_id não encontrado na URL e sem link certificado');
+      throw new Error(`PASSO 3: authorization_id não encontrado e sem link certificado. URL atual: ${urlParaCert}`);
     }
 
     // Construir lista de URLs candidatas para tentar (em ordem)
