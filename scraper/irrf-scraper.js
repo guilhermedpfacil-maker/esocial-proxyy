@@ -291,9 +291,11 @@ class ESocialIRRFScraper {
       }
     }
 
-    if (!newPageOpened && govBrClicked.method !== 'direct-navigation') {
-      await sleep(2000);
-    }
+    // Aguardar a página estabilizar (o /authorize redireciona para /login automaticamente)
+    try {
+      await this.page.waitForLoadState('networkidle', { timeout: 15000 });
+    } catch {}
+    await sleep(2000);
 
     await this.page.screenshot({ path: '/tmp/esocial_02_pagina_apos_clique.png' });
     const urlAposClique = this.page.url();
@@ -304,14 +306,22 @@ class ESocialIRRFScraper {
       throw new Error(`PASSO 2 FALHOU: Redirecionou para portal genérico (${urlAposClique})`);
     }
 
-    const buttons2 = await this.page.$$eval('a, button, [role="button"], li, [class*="card"]', els =>
-      els.map(el => ({ tag: el.tagName, text: el.textContent?.trim().substring(0, 50), classes: el.className?.substring?.(0, 30) || '' })).filter(e => e.text)
-    );
+    let buttons2 = [];
+    try {
+      buttons2 = await this.page.$$eval('a, button, [role="button"], li, [class*="card"]', els =>
+        els.map(el => ({ tag: el.tagName, text: el.textContent?.trim().substring(0, 50), classes: el.className?.substring?.(0, 30) || '' })).filter(e => e.text)
+      );
+    } catch (e) {
+      console.log('[Scraper] PASSO 2: Aviso ao listar elementos:', e.message);
+    }
     console.log('[Scraper] PASSO 2: Elementos disponíveis:', JSON.stringify(buttons2.slice(0, 15), null, 2));
 
     // ============================================
     // PASSO 3: Clicar em "Seu certificado digital"
     // ============================================
+    // Garantir que a página estabilizou (pode ter redirected do /authorize para /login)
+    try { await this.page.waitForLoadState('domcontentloaded', { timeout: 10000 }); } catch {}
+
     console.log('[Scraper] PASSO 3: URL antes de buscar certificado:', this.page.url());
     console.log('[Scraper] PASSO 3: Procurando opção "Seu certificado digital"...');
 
