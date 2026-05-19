@@ -393,8 +393,83 @@ class ESocialIRRFScraper {
 
     await this.page.screenshot({ path: '/tmp/esocial_03_antes_clique.png' });
 
+    // Interceptar requests ANTES do clique para capturar a URL que o JS chama
+    const capturedReqs = [];
+    const capturedResps = [];
+    const reqListener = req => {
+      const url = req.url();
+      if (url.includes('sso.acesso.gov.br') && !url.match(/\.(css|js|png|jpg|svg|woff|woff2|ico|gif)(\?|$)/)) {
+        capturedReqs.push({ url: url.substring(0, 200), method: req.method(), isNav: req.isNavigationRequest() });
+      }
+    };
+    const respListener = resp => {
+      const url = resp.url();
+      if (url.includes('sso.acesso.gov.br') && !url.match(/\.(css|js|png|jpg|svg|woff|woff2|ico|gif)(\?|$)/)) {
+        capturedResps.push({ url: url.substring(0, 200), status: resp.status() });
+      }
+    };
+    this.page.on('request', reqListener);
+    this.page.on('response', respListener);
+
+    // Tentar navegação direta para endpoint de certificado (padrões conhecidos)
+    const currentLoginUrl = this.page.url();
+    const authIdMatch = currentLoginUrl.match(/authorization_id=([^&]+)/);
+    const authId = authIdMatch ? authIdMatch[1] : authorizationId;
+    const clientIdMatch = currentLoginUrl.match(/client_id=([^&]+)/);
+    const clientId = clientIdMatch ? decodeURIComponent(clientIdMatch[1]) : 'login.esocial.gov.br';
+
+    if (authId) {
+      // Tentar navegar diretamente para o endpoint de certificado — Playwright apresenta o cert via mTLS
+      const certEndpoints = [
+        `https://sso.acesso.gov.br/login/certificado?client_id=${encodeURIComponent(clientId)}&authorization_id=${authId}`,
+        `https://sso.acesso.gov.br/login/certificado?authorization_id=${authId}`,
+        `https://sso.acesso.gov.br/certificado?client_id=${encodeURIComponent(clientId)}&authorization_id=${authId}`,
+        `https://sso.acesso.gov.br/certificado?authorization_id=${authId}`,
+        `https://sso.acesso.gov.br/authorize/certificate?authorization_id=${authId}`,
+      ];
+
+      console.log('[Scraper] PASSO 3: Tentando navegação direta para endpoints de certificado...');
+      for (const endpoint of certEndpoints) {
+        console.log('[Scraper] PASSO 3: Tentando:', endpoint);
+        try {
+          await this.page.goto(endpoint, { waitUntil: 'commit', timeout: 10000 });
+          await sleep(2000);
+          const urlAgora = this.page.url();
+          const statusCode = capturedResps.find(r => r.url.includes(endpoint.substring(0, 80)));
+          console.log('[Scraper] PASSO 3: URL após tentativa:', urlAgora, '| Status:', statusCode?.status);
+          if (!urlAgora.includes('sso.acesso.gov.br')) {
+            console.log('[Scraper] PASSO 3: ✓ Saiu do SSO via navegação direta!', urlAgora);
+            this.page.off('request', reqListener);
+            this.page.off('response', respListener);
+            console.log('[Scraper] === LOGIN CONCLUÍDO (navegação direta) ===');
+            return;
+          }
+          // Se recebeu 200 mas ficou no SSO — pode ser que o cert foi apresentado, aguardar redirect
+          if (!urlAgora.includes('404') && !urlAgora.includes('error')) {
+            await sleep(5000);
+            const urlDepois = this.page.url();
+            console.log('[Scraper] PASSO 3: URL após 5s de espera:', urlDepois);
+            if (!urlDepois.includes('sso.acesso.gov.br')) {
+              console.log('[Scraper] PASSO 3: ✓ Redirect detectado!', urlDepois);
+              this.page.off('request', reqListener);
+              this.page.off('response', respListener);
+              console.log('[Scraper] === LOGIN CONCLUÍDO (redirect após cert) ===');
+              return;
+            }
+          }
+        } catch (e) {
+          console.log('[Scraper] PASSO 3: Erro ao tentar endpoint:', e.message?.substring(0, 100));
+        }
+        // Voltar para a página de login antes de tentar o próximo endpoint
+        try {
+          await this.page.goto(`https://sso.acesso.gov.br/login?client_id=${encodeURIComponent(clientId)}&authorization_id=${authId}`, { waitUntil: 'domcontentloaded', timeout: 15000 });
+          await sleep(1000);
+        } catch {}
+      }
+      console.log('[Scraper] PASSO 3: Nenhum endpoint direto funcionou. Voltando ao clique no botão.');
+    }
+
     // Clicar em "Seu certificado digital" usando TreeWalker (encontra texto exato)
-    // Playwright vai interceptar a navegação resultante e apresentar o cert via mTLS automaticamente
     const clickResult = await this.page.evaluate(() => {
       const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
       let node;
@@ -402,7 +477,6 @@ class ESocialIRRFScraper {
         const text = node.textContent?.trim().toLowerCase();
         if (text && (text === 'seu certificado digital' || text.includes('seu certificado digital'))) {
           let clickTarget = node.parentElement;
-          // Subir na árvore até encontrar o melhor elemento clicável
           for (let el = clickTarget; el && el.tagName !== 'BODY'; el = el.parentElement) {
             if (el.tagName === 'A' || el.tagName === 'BUTTON' ||
                 el.getAttribute('onclick') || el.getAttribute('role') === 'button' ||
@@ -425,7 +499,6 @@ class ESocialIRRFScraper {
     console.log('[Scraper] PASSO 3: Resultado do clique:', JSON.stringify(clickResult));
 
     if (!clickResult) {
-      // Fallback: tentar via querySelector com textos conhecidos
       const fallbackClicked = await this.page.evaluate(() => {
         const texts = ['Seu certificado digital', 'certificado digital', 'certificado'];
         for (const text of texts) {
@@ -444,7 +517,35 @@ class ESocialIRRFScraper {
       console.log('[Scraper] PASSO 3: Fallback clique:', JSON.stringify(fallbackClicked));
     }
 
-    await sleep(2000);
+    // Aguardar requests do JS do botão
+    await sleep(8000);
+    this.page.off('request', reqListener);
+    this.page.off('response', respListener);
+    console.log('[Scraper] PASSO 3: Requests capturados após clique:', JSON.stringify(capturedReqs));
+    console.log('[Scraper] PASSO 3: Responses capturados após clique:', JSON.stringify(capturedResps));
+
+    // Se o JS do botão fez um fetch/XHR para um endpoint de cert, navegar diretamente para ele
+    const currentPageUrl = this.page.url();
+    const certReq = capturedReqs.find(r =>
+      r.url !== currentPageUrl &&
+      (r.url.includes('certificado') || r.url.includes('certificate') || r.url.includes('cert'))
+    );
+    if (certReq) {
+      console.log('[Scraper] PASSO 3: Navegando diretamente para URL capturada:', certReq.url);
+      try {
+        await this.page.goto(certReq.url, { waitUntil: 'networkidle', timeout: 30000 });
+        const urlAposNav = this.page.url();
+        console.log('[Scraper] PASSO 3: URL após navegação direta:', urlAposNav);
+        if (!urlAposNav.includes('sso.acesso.gov.br')) {
+          console.log('[Scraper] PASSO 3: ✓ Login via navegação direta para URL capturada!');
+          console.log('[Scraper] === LOGIN CONCLUÍDO (URL capturada do JS) ===');
+          return;
+        }
+      } catch (e) {
+        console.log('[Scraper] PASSO 3: Erro ao navegar para URL capturada:', e.message?.substring(0, 100));
+      }
+    }
+
     console.log('[Scraper] PASSO 3: URL após clique:', this.page.url());
     await this.page.screenshot({ path: '/tmp/esocial_03_apos_clique.png' });
 
