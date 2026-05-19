@@ -8,12 +8,50 @@
  * (não depende do NSS database do Chrome)
  */
 
-const SCRAPER_VERSION = 'v2.3.0-playwright-mtls-2025';
+const SCRAPER_VERSION = 'v2.4.0-mtls-nodejs-direct-2025';
 
 const { chromium } = require('playwright-core');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+
+// Faz requisição HTTPS com certificado cliente (mTLS) via Node.js nativo.
+// Node.js apresenta o cert no handshake TLS de verdade — independente do Playwright proxy.
+// Não segue redirects (retorna o Location header para o chamador navegar).
+function doMtlsRequest(endpoint, pfxBuffer, passphrase, extraHeaders = {}) {
+  return new Promise((resolve, reject) => {
+    let url;
+    try { url = new URL(endpoint); } catch (e) { return reject(e); }
+    const req = https.request({
+      hostname: url.hostname,
+      port: 443,
+      path: url.pathname + url.search,
+      method: 'GET',
+      pfx: pfxBuffer,
+      passphrase,
+      rejectUnauthorized: true,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'pt-BR,pt;q=0.9',
+        ...extraHeaders,
+      },
+    }, res => {
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => resolve({
+        status: res.statusCode,
+        location: res.headers['location'] || null,
+        setCookie: res.headers['set-cookie'] || [],
+        body: Buffer.concat(chunks).toString('utf-8').substring(0, 1500),
+      }));
+    });
+    req.on('error', reject);
+    req.setTimeout(30000, () => { req.destroy(); reject(new Error('mTLS request timeout')); });
+    req.end();
+  });
+}
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -117,8 +155,30 @@ class ESocialIRRFScraper {
     const timestamp = Date.now();
 
     const pfxBuffer = Buffer.from(this.certificatePfxBase64, 'base64');
+    this.pfxBuffer = pfxBuffer; // salvo para uso em doMtlsRequest no login()
     this.tempCertPath = path.join(os.tmpdir(), `cert_${timestamp}.pfx`);
     fs.writeFileSync(this.tempCertPath, pfxBuffer);
+
+    // Validar cert PFX via node-forge para diagnóstico
+    try {
+      const forge = require('node-forge');
+      const p12Asn1 = forge.asn1.fromDer(pfxBuffer.toString('binary'));
+      const p12 = forge.pkcs12.pkcs12FromAsn1(p12Asn1, this.password);
+      const certBags = p12.getBags({ bagType: forge.pki.oids.certBag })[forge.pki.oids.certBag] || [];
+      if (certBags.length > 0) {
+        const cert = certBags[0].cert;
+        const now = new Date();
+        const isExpired = now > cert.validity.notAfter;
+        console.log('[Scraper] Certificado PFX carregado:');
+        console.log('[Scraper]   Subject CN:', cert.subject.getField('CN')?.value);
+        console.log('[Scraper]   Issuer CN:', cert.issuer.getField('CN')?.value);
+        console.log('[Scraper]   Válido de:', cert.validity.notBefore);
+        console.log('[Scraper]   Válido até:', cert.validity.notAfter);
+        console.log('[Scraper]   EXPIRADO?:', isExpired ? '⚠ SIM' : 'Não');
+      }
+    } catch (forgeErr) {
+      console.log('[Scraper] Aviso: não foi possível validar PFX via node-forge:', forgeErr.message?.substring(0, 80));
+    }
 
     this.tempUserDataDir = path.join(os.tmpdir(), `chrome_${timestamp}`);
     fs.mkdirSync(this.tempUserDataDir, { recursive: true });
@@ -333,219 +393,119 @@ class ESocialIRRFScraper {
     }
 
     // ============================================
-    // PASSO 3: Navegar para endpoint de certificado
+    // PASSO 3: mTLS direto via Node.js https nativo
     // ============================================
+    // Estratégia: usar Node.js nativo para fazer a requisição mTLS ao endpoint de certificado.
+    // O módulo https do Node.js apresenta o cert no handshake TLS de verdade.
+    // Se o servidor aceitar → retorna 302 redirect para o callback OAuth do eSocial.
+    // Pegamos esse redirect URL e navegamos o Playwright para lá — completando o OAuth.
     try { await this.page.waitForLoadState('domcontentloaded', { timeout: 10000 }); } catch {}
 
-    const urlParaCert = this.page.url();
-    console.log('[Scraper] PASSO 3: URL atual:', urlParaCert);
-    console.log('[Scraper] PASSO 3: authorization_id (do PASSO 2):', authorizationId);
-
-    // Dump todos os links visíveis para diagnóstico
-    const linksNaPagina = await this.page.$$eval('a', links =>
-      links.map(a => ({ text: a.textContent?.trim().substring(0, 60), href: a.getAttribute('href') }))
-    ).catch(() => []);
-    console.log('[Scraper] PASSO 3: Links <a> na página:', JSON.stringify(linksNaPagina));
-
-    // "Seu certificado digital" NÃO é um <a> link — é um elemento JS
-    // Usar TreeWalker para encontrar o texto exato e clicar no elemento correto
-
-    // Se estamos numa página 404 ou errada, voltar para a página de login
     const urlAtualP3 = this.page.url();
+    console.log('[Scraper] PASSO 3: URL atual:', urlAtualP3);
+    console.log('[Scraper] PASSO 3: authorization_id:', authorizationId);
+
+    // Garantir que estamos na página de login (não em 404 ou página errada)
     if (!urlAtualP3.includes('sso.acesso.gov.br/login?') && authorizationId) {
-      const loginPageUrl = `https://sso.acesso.gov.br/login?client_id=login.esocial.gov.br&authorization_id=${authorizationId}`;
-      console.log('[Scraper] PASSO 3: Voltando para página de login:', loginPageUrl);
       try {
-        await this.page.goto(loginPageUrl, { waitUntil: 'networkidle', timeout: 30000 });
+        await this.page.goto(
+          `https://sso.acesso.gov.br/login?client_id=login.esocial.gov.br&authorization_id=${authorizationId}`,
+          { waitUntil: 'domcontentloaded', timeout: 15000 }
+        );
+        await sleep(1500);
       } catch (e) {
-        console.log('[Scraper] PASSO 3: Aviso ao navegar para login:', e.message?.substring(0, 80));
+        console.log('[Scraper] PASSO 3: Aviso ao voltar ao login:', e.message?.substring(0, 60));
       }
-      await sleep(2000);
     }
 
-    console.log('[Scraper] PASSO 3: URL antes de clicar cert:', this.page.url());
+    await this.page.screenshot({ path: '/tmp/esocial_03_antes_cert.png' });
 
-    // Dump detalhado dos elementos com texto "certificado" para diagnóstico
-    const certButtonInfo = await this.page.evaluate(() => {
-      const results = [];
-      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-      let node;
-      while ((node = walker.nextNode())) {
-        const text = node.textContent?.trim();
-        if (text?.toLowerCase().includes('certificado digital') || text?.toLowerCase().includes('seu certificado')) {
-          const parent = node.parentElement;
-          if (!parent) continue;
-          const rect = parent.getBoundingClientRect();
-          results.push({
-            text: text.substring(0, 60),
-            parentTag: parent.tagName,
-            parentClasses: parent.className?.substring(0, 60),
-            parentOnclick: parent.getAttribute('onclick'),
-            grandParentTag: parent.parentElement?.tagName,
-            grandParentClasses: parent.parentElement?.className?.substring(0, 60),
-            isVisible: rect.width > 0 && rect.height > 0
+    if (authorizationId) {
+      const certUrl = `https://sso.acesso.gov.br/login/certificado?client_id=login.esocial.gov.br&authorization_id=${authorizationId}`;
+      // Capturar cookies da sessão SSO para enviar junto com a requisição mTLS
+      const ssoCookies = await this.context.cookies('https://sso.acesso.gov.br');
+      const cookieStr = ssoCookies.map(c => `${c.name}=${c.value}`).join('; ');
+      console.log('[Scraper] PASSO 3: Cookies SSO capturados:', ssoCookies.length, 'cookies');
+      console.log('[Scraper] PASSO 3: Fazendo requisição mTLS via Node.js nativo para:', certUrl);
+
+      try {
+        const mtlsResp = await doMtlsRequest(certUrl, this.pfxBuffer, this.password, {
+          Cookie: cookieStr,
+          Referer: `https://sso.acesso.gov.br/login?client_id=login.esocial.gov.br&authorization_id=${authorizationId}`,
+        });
+        console.log('[Scraper] PASSO 3: mTLS status:', mtlsResp.status);
+        console.log('[Scraper] PASSO 3: mTLS location:', mtlsResp.location);
+        console.log('[Scraper] PASSO 3: mTLS body (200 chars):', mtlsResp.body.substring(0, 200).replace(/\n/g, ' '));
+
+        if (mtlsResp.status >= 300 && mtlsResp.status < 400 && mtlsResp.location) {
+          // Sucesso mTLS! Navegar o Playwright para o callback URL do OAuth
+          let callbackUrl = mtlsResp.location;
+          if (callbackUrl.startsWith('/')) {
+            callbackUrl = 'https://sso.acesso.gov.br' + callbackUrl;
+          }
+          console.log('[Scraper] PASSO 3: ✓ mTLS funcionou! Redirect para:', callbackUrl);
+          await this.page.goto(callbackUrl, { waitUntil: 'networkidle', timeout: 60000 }).catch(e => {
+            console.log('[Scraper] PASSO 3: Aviso ao navegar para callback:', e.message?.substring(0, 80));
           });
-        }
-      }
-      return results;
-    }).catch(() => []);
-    console.log('[Scraper] PASSO 3: Elementos "certificado digital":', JSON.stringify(certButtonInfo));
-
-    await this.page.screenshot({ path: '/tmp/esocial_03_antes_clique.png' });
-
-    // Interceptar requests ANTES do clique para capturar a URL que o JS chama
-    const capturedReqs = [];
-    const capturedResps = [];
-    const reqListener = req => {
-      const url = req.url();
-      if (url.includes('sso.acesso.gov.br') && !url.match(/\.(css|js|png|jpg|svg|woff|woff2|ico|gif)(\?|$)/)) {
-        capturedReqs.push({ url: url.substring(0, 200), method: req.method(), isNav: req.isNavigationRequest() });
-      }
-    };
-    const respListener = resp => {
-      const url = resp.url();
-      if (url.includes('sso.acesso.gov.br') && !url.match(/\.(css|js|png|jpg|svg|woff|woff2|ico|gif)(\?|$)/)) {
-        capturedResps.push({ url: url.substring(0, 200), status: resp.status() });
-      }
-    };
-    this.page.on('request', reqListener);
-    this.page.on('response', respListener);
-
-    // Tentar navegação direta para endpoint de certificado (padrões conhecidos)
-    const currentLoginUrl = this.page.url();
-    const authIdMatch = currentLoginUrl.match(/authorization_id=([^&]+)/);
-    const authId = authIdMatch ? authIdMatch[1] : authorizationId;
-    const clientIdMatch = currentLoginUrl.match(/client_id=([^&]+)/);
-    const clientId = clientIdMatch ? decodeURIComponent(clientIdMatch[1]) : 'login.esocial.gov.br';
-
-    if (authId) {
-      // Tentar navegar diretamente para o endpoint de certificado — Playwright apresenta o cert via mTLS
-      const certEndpoints = [
-        `https://sso.acesso.gov.br/login/certificado?client_id=${encodeURIComponent(clientId)}&authorization_id=${authId}`,
-        `https://sso.acesso.gov.br/login/certificado?authorization_id=${authId}`,
-        `https://sso.acesso.gov.br/certificado?client_id=${encodeURIComponent(clientId)}&authorization_id=${authId}`,
-        `https://sso.acesso.gov.br/certificado?authorization_id=${authId}`,
-        `https://sso.acesso.gov.br/authorize/certificate?authorization_id=${authId}`,
-      ];
-
-      console.log('[Scraper] PASSO 3: Tentando navegação direta para endpoints de certificado...');
-      for (const endpoint of certEndpoints) {
-        console.log('[Scraper] PASSO 3: Tentando:', endpoint);
-        try {
-          await this.page.goto(endpoint, { waitUntil: 'commit', timeout: 10000 });
-          await sleep(2000);
-          const urlAgora = this.page.url();
-          const statusCode = capturedResps.find(r => r.url.includes(endpoint.substring(0, 80)));
-          console.log('[Scraper] PASSO 3: URL após tentativa:', urlAgora, '| Status:', statusCode?.status);
-          if (!urlAgora.includes('sso.acesso.gov.br')) {
-            console.log('[Scraper] PASSO 3: ✓ Saiu do SSO via navegação direta!', urlAgora);
-            this.page.off('request', reqListener);
-            this.page.off('response', respListener);
-            console.log('[Scraper] === LOGIN CONCLUÍDO (navegação direta) ===');
+          const urlApos = this.page.url();
+          console.log('[Scraper] PASSO 3: URL após callback:', urlApos);
+          if (!urlApos.includes('sso.acesso.gov.br')) {
+            console.log('[Scraper] === LOGIN CONCLUÍDO via mTLS Node.js direto ===');
             return;
           }
-          // Se recebeu 200 mas ficou no SSO — pode ser que o cert foi apresentado, aguardar redirect
-          if (!urlAgora.includes('404') && !urlAgora.includes('error')) {
-            await sleep(5000);
-            const urlDepois = this.page.url();
-            console.log('[Scraper] PASSO 3: URL após 5s de espera:', urlDepois);
-            if (!urlDepois.includes('sso.acesso.gov.br')) {
-              console.log('[Scraper] PASSO 3: ✓ Redirect detectado!', urlDepois);
-              this.page.off('request', reqListener);
-              this.page.off('response', respListener);
-              console.log('[Scraper] === LOGIN CONCLUÍDO (redirect após cert) ===');
-              return;
-            }
+          console.log('[Scraper] PASSO 3: Ainda no SSO após callback. Aguardando redirect...');
+          await sleep(5000);
+          const urlFinalMtls = this.page.url();
+          console.log('[Scraper] PASSO 3: URL final após espera:', urlFinalMtls);
+          if (!urlFinalMtls.includes('sso.acesso.gov.br')) {
+            console.log('[Scraper] === LOGIN CONCLUÍDO via mTLS (redirect tardio) ===');
+            return;
           }
-        } catch (e) {
-          console.log('[Scraper] PASSO 3: Erro ao tentar endpoint:', e.message?.substring(0, 100));
+        } else if (mtlsResp.status === 200) {
+          console.log('[Scraper] PASSO 3: mTLS retornou 200 (sem redirect). Body pode conter form ou erro.');
+          // Aguardar um pouco — talvez a resposta 200 gere um redirect via JS
+          await sleep(5000);
+          const urlApos200 = this.page.url();
+          if (!urlApos200.includes('sso.acesso.gov.br')) {
+            console.log('[Scraper] === LOGIN CONCLUÍDO (200 + redirect browser) ===');
+            return;
+          }
+        } else {
+          console.log(`[Scraper] PASSO 3: mTLS retornou ${mtlsResp.status}. Cert pode ser inválido/expirado para gov.br.`);
         }
-        // Voltar para a página de login antes de tentar o próximo endpoint
-        try {
-          await this.page.goto(`https://sso.acesso.gov.br/login?client_id=${encodeURIComponent(clientId)}&authorization_id=${authId}`, { waitUntil: 'domcontentloaded', timeout: 15000 });
-          await sleep(1000);
-        } catch {}
+      } catch (mtlsErr) {
+        // Erro TLS = servidor rejeitou o certificado ou o handshake falhou
+        console.log('[Scraper] PASSO 3: Erro na requisição mTLS:', mtlsErr.message?.substring(0, 200));
+        if (mtlsErr.code) console.log('[Scraper] PASSO 3: Código de erro TLS:', mtlsErr.code);
       }
-      console.log('[Scraper] PASSO 3: Nenhum endpoint direto funcionou. Voltando ao clique no botão.');
+    } else {
+      console.log('[Scraper] PASSO 3: Sem authorization_id — pulando mTLS direto');
     }
 
-    // Clicar em "Seu certificado digital" usando TreeWalker (encontra texto exato)
+    // Fallback: clicar o botão "Seu certificado digital"
+    // (hcaptcha pode bloquear, mas vale tentar)
+    console.log('[Scraper] PASSO 3: Fallback — tentando clicar botão "Seu certificado digital"...');
     const clickResult = await this.page.evaluate(() => {
       const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
       let node;
       while ((node = walker.nextNode())) {
         const text = node.textContent?.trim().toLowerCase();
-        if (text && (text === 'seu certificado digital' || text.includes('seu certificado digital'))) {
+        if (text === 'seu certificado digital' || text.includes('seu certificado digital')) {
           let clickTarget = node.parentElement;
           for (let el = clickTarget; el && el.tagName !== 'BODY'; el = el.parentElement) {
             if (el.tagName === 'A' || el.tagName === 'BUTTON' ||
-                el.getAttribute('onclick') || el.getAttribute('role') === 'button' ||
-                el.getAttribute('role') === 'link') {
-              clickTarget = el;
-              break;
+                el.getAttribute('onclick') || el.getAttribute('role') === 'button') {
+              clickTarget = el; break;
             }
           }
           clickTarget?.click();
-          return {
-            clicked: true,
-            text: node.textContent?.trim(),
-            tag: clickTarget?.tagName,
-            classes: clickTarget?.className?.substring(0, 60)
-          };
+          return { clicked: true, tag: clickTarget?.tagName, classes: clickTarget?.className?.substring(0, 60) };
         }
       }
       return null;
     });
-    console.log('[Scraper] PASSO 3: Resultado do clique:', JSON.stringify(clickResult));
-
-    if (!clickResult) {
-      const fallbackClicked = await this.page.evaluate(() => {
-        const texts = ['Seu certificado digital', 'certificado digital', 'certificado'];
-        for (const text of texts) {
-          const candidates = Array.from(document.querySelectorAll('*')).filter(el => {
-            const t = (el.textContent || '').trim();
-            const rect = el.getBoundingClientRect();
-            return el.children.length === 0 && t === text && rect.width > 0 && rect.height > 0;
-          });
-          if (candidates.length > 0) {
-            candidates[0].click();
-            return { clicked: true, text };
-          }
-        }
-        return null;
-      });
-      console.log('[Scraper] PASSO 3: Fallback clique:', JSON.stringify(fallbackClicked));
-    }
-
-    // Aguardar requests do JS do botão
-    await sleep(8000);
-    this.page.off('request', reqListener);
-    this.page.off('response', respListener);
-    console.log('[Scraper] PASSO 3: Requests capturados após clique:', JSON.stringify(capturedReqs));
-    console.log('[Scraper] PASSO 3: Responses capturados após clique:', JSON.stringify(capturedResps));
-
-    // Se o JS do botão fez um fetch/XHR para um endpoint de cert, navegar diretamente para ele
-    const currentPageUrl = this.page.url();
-    const certReq = capturedReqs.find(r =>
-      r.url !== currentPageUrl &&
-      (r.url.includes('certificado') || r.url.includes('certificate') || r.url.includes('cert'))
-    );
-    if (certReq) {
-      console.log('[Scraper] PASSO 3: Navegando diretamente para URL capturada:', certReq.url);
-      try {
-        await this.page.goto(certReq.url, { waitUntil: 'networkidle', timeout: 30000 });
-        const urlAposNav = this.page.url();
-        console.log('[Scraper] PASSO 3: URL após navegação direta:', urlAposNav);
-        if (!urlAposNav.includes('sso.acesso.gov.br')) {
-          console.log('[Scraper] PASSO 3: ✓ Login via navegação direta para URL capturada!');
-          console.log('[Scraper] === LOGIN CONCLUÍDO (URL capturada do JS) ===');
-          return;
-        }
-      } catch (e) {
-        console.log('[Scraper] PASSO 3: Erro ao navegar para URL capturada:', e.message?.substring(0, 100));
-      }
-    }
-
+    console.log('[Scraper] PASSO 3: Clique fallback:', JSON.stringify(clickResult));
+    await sleep(3000);
     console.log('[Scraper] PASSO 3: URL após clique:', this.page.url());
     await this.page.screenshot({ path: '/tmp/esocial_03_apos_clique.png' });
 
