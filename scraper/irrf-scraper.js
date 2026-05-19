@@ -682,14 +682,44 @@ class ESocialIRRFScraper {
     
     console.log('[Scraper] PASSO 3: Clicou em certificado digital:', JSON.stringify(certClicked));
     
-    console.log('[Scraper] Clicou em "Seu certificado digital". Aguardando popup/autenticação...');
-    
+    console.log('[Scraper] Clicou em "Seu certificado digital". Tentando autenticação via curl...');
+
     // ============================================
-    // PASSO 4: Aguardar popup de certificado e autenticação
+    // PASSO 4: Autenticação mTLS via curl (confiável em containers)
     // ============================================
-    console.log('[Scraper] PASSO 4: Aguardando seleção automática de certificado...');
-    console.log('[Scraper] Auto-select configurado para qualquer URL que pedir certificado');
-    console.log('[Scraper] Se popup aparecer, Chrome deve selecionar automaticamente do NSS database');
+    // Aguardar brevemente para o SSO processar o clique e possivelmente redirecionar
+    await sleep(3000);
+    await this.page.screenshot({ path: '/tmp/esocial_04a_apos_cert_click.png' });
+
+    const urlAposCertClick = this.page.url();
+    console.log('[Scraper] PASSO 4: URL após clicar em certificado:', urlAposCertClick);
+
+    // Capturar cookies da sessão SSO para passar ao curl (mantém state OAuth)
+    const ssoCookies = await this.page.cookies();
+    console.log('[Scraper] PASSO 4: Cookies SSO:', ssoCookies.map(c => c.name).join(', '));
+
+    // Usar curl com cert PEM para completar o fluxo OAuth
+    const callbackUrl = await this.authenticateWithCurl(urlAposCertClick, ssoCookies);
+
+    if (callbackUrl && !callbackUrl.includes('sso.acesso.gov.br') && callbackUrl.includes('gov.br')) {
+      console.log('[Scraper] PASSO 4: ✓ curl autenticou! Navegando para callback:', callbackUrl);
+      try {
+        await this.page.goto(callbackUrl, { waitUntil: 'networkidle2', timeout: 60000 });
+        await sleep(2000);
+        await this.page.screenshot({ path: '/tmp/esocial_04b_callback.png' });
+        const urlFinal = this.page.url();
+        console.log('[Scraper] PASSO 4: URL após callback:', urlFinal);
+        if (!urlFinal.includes('login.esocial.gov.br/login.aspx') && !urlFinal.includes('sso.acesso.gov.br')) {
+          console.log('[Scraper] === LOGIN VIA CURL CONCLUÍDO ===');
+          return; // Login bem-sucedido via curl!
+        }
+      } catch (navErr) {
+        console.log('[Scraper] PASSO 4: Erro ao navegar para callback:', navErr.message);
+      }
+    }
+
+    console.log('[Scraper] PASSO 4: curl não retornou callback válido, aguardando Chrome...');
+    console.log('[Scraper] PASSO 4: Aguardando seleção automática de certificado pelo Chrome...');
     
     // Loop de verificação: aguardar até 120 segundos para o login completar
     const loginStartTime = Date.now();
@@ -795,6 +825,69 @@ class ESocialIRRFScraper {
     }
     
     console.log('[Scraper] === LOGIN CONCLUÍDO COM SUCESSO ===');
+  }
+
+  /**
+   * Usa curl com certificado PEM para seguir o fluxo OAuth do gov.br.
+   * Retorna a URL de callback do eSocial (com código de autorização).
+   */
+  async authenticateWithCurl(url, cookies = []) {
+    const forge = require('node-forge');
+    const ts = Date.now();
+
+    // Converter PFX → PEM usando node-forge
+    let privateKeyPem, certPem;
+    try {
+      const pfxDer = forge.util.decode64(this.certificatePfxBase64);
+      const pfx = forge.pkcs12.pkcs12FromAsn1(forge.asn1.fromDer(pfxDer), false, this.password);
+      const keyBags = pfx.getBags({ bagType: forge.pki.oids.pkcs8ShroudedKeyBag });
+      const certBags = pfx.getBags({ bagType: forge.pki.oids.certBag });
+      const keyBag  = keyBags[forge.pki.oids.pkcs8ShroudedKeyBag]?.[0];
+      const certBag = certBags[forge.pki.oids.certBag]?.[0];
+      if (!keyBag || !certBag) throw new Error('PFX sem chave privada ou certificado');
+      privateKeyPem = forge.pki.privateKeyToPem(keyBag.key);
+      certPem       = forge.pki.certificateToPem(certBag.cert);
+    } catch (e) {
+      console.error('[Scraper] Erro ao converter PFX para PEM:', e.message);
+      return null;
+    }
+
+    const keyFile  = path.join(os.tmpdir(), `k_${ts}.pem`);
+    const crtFile  = path.join(os.tmpdir(), `c_${ts}.pem`);
+    const ckFile   = path.join(os.tmpdir(), `ck_${ts}.txt`);
+    fs.writeFileSync(keyFile, privateKeyPem, { mode: 0o600 });
+    fs.writeFileSync(crtFile, certPem);
+
+    // Montar header de cookies da sessão SSO do Puppeteer
+    const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+
+    try {
+      const args = [
+        'curl',
+        `--cert "${crtFile}"`,
+        `--key "${keyFile}"`,
+        '--insecure',           // ignora erros de cert do servidor
+        '-L',                   // segue redirects
+        '-s',                   // silencioso
+        '-o /dev/null',
+        '-w "%{url_effective}"',// imprime URL final
+        '--max-redirs 20',
+        '--connect-timeout 30',
+        '--max-time 60',
+      ];
+      if (cookieHeader) args.push(`-H "Cookie: ${cookieHeader}"`);
+      args.push(`"${url}"`);
+
+      const finalUrl = execSync(args.join(' '), { encoding: 'utf-8', timeout: 70000 }).trim();
+      console.log('[Scraper] curl URL final:', finalUrl);
+      return finalUrl;
+    } catch (e) {
+      console.error('[Scraper] curl erro:', e.message);
+      return null;
+    } finally {
+      try { fs.unlinkSync(keyFile); fs.unlinkSync(crtFile); } catch {}
+      try { fs.unlinkSync(ckFile); } catch {}
+    }
   }
 
   async navigateToIRRF() {
