@@ -596,6 +596,23 @@ class ESocialIRRFScraper {
     }
     
     console.log('[Scraper] PASSO 3: Procurando opção "Seu certificado digital"...');
+
+    // Verificar se o gov.br exibe campo de CPF na mesma página
+    // Nesse caso, NÃO preencher — usar apenas "Seu certificado digital" diretamente
+    const temCampoCpf = await this.page.evaluate(() => {
+      const inputs = Array.from(document.querySelectorAll('input'));
+      return inputs.some(el => {
+        const t = (el.type || '').toLowerCase();
+        const id = (el.id || '').toLowerCase();
+        const name = (el.name || '').toLowerCase();
+        const ph = (el.placeholder || '').toLowerCase();
+        return (t === 'text' || t === 'tel' || t === 'number') &&
+               (id.includes('cpf') || name.includes('cpf') || ph.includes('cpf'));
+      });
+    });
+    console.log('[Scraper] PASSO 3: Campo CPF visível na página:', temCampoCpf);
+    // O certificado digital já contém o CPF — clicar direto em "Seu certificado digital"
+    // sem preencher o campo CPF (o gov.br aceita certificado sem CPF digitado)
     
     // 1. Buscar por seletores conhecidos do gov.br + texto
     let certClicked = await this.page.evaluate(() => {
@@ -681,13 +698,40 @@ class ESocialIRRFScraper {
     }
     
     console.log('[Scraper] PASSO 3: Clicou em certificado digital:', JSON.stringify(certClicked));
-    
+
+    // ============================================
+    // PASSO 3b: Capturar URL para a qual "Seu certificado digital" navega
+    // ============================================
+    // Extrair href ANTES de clicar (para passar ao curl sem depender do Chrome)
+    const certHref = await this.page.evaluate(() => {
+      const texts = ['seu certificado digital', 'certificado digital', 'e-cpf', 'e-cnpj'];
+      const allEls = Array.from(document.querySelectorAll('a, button, li, div, span'));
+      for (const el of allEls) {
+        const t = (el.textContent || '').toLowerCase().trim();
+        if (texts.some(s => t.includes(s))) {
+          // Tentar pegar href próprio ou do pai mais próximo que seja um link
+          let node = el;
+          while (node && node !== document.body) {
+            if (node.tagName === 'A' && node.getAttribute('href')) {
+              const h = node.getAttribute('href');
+              return h.startsWith('http') ? h : window.location.origin + h;
+            }
+            node = node.parentElement;
+          }
+          // Verificar se há form action associado
+          const form = el.closest('form');
+          if (form && form.action) return form.action;
+        }
+      }
+      return null;
+    });
+    console.log('[Scraper] PASSO 3b: href do certificado:', certHref);
+
     console.log('[Scraper] Clicou em "Seu certificado digital". Tentando autenticação via curl...');
 
     // ============================================
     // PASSO 4: Autenticação mTLS via curl (confiável em containers)
     // ============================================
-    // Aguardar brevemente para o SSO processar o clique e possivelmente redirecionar
     await sleep(3000);
     await this.page.screenshot({ path: '/tmp/esocial_04a_apos_cert_click.png' });
 
@@ -698,8 +742,11 @@ class ESocialIRRFScraper {
     const ssoCookies = await this.page.cookies();
     console.log('[Scraper] PASSO 4: Cookies SSO:', ssoCookies.map(c => c.name).join(', '));
 
-    // Usar curl com cert PEM para completar o fluxo OAuth
-    const callbackUrl = await this.authenticateWithCurl(urlAposCertClick, ssoCookies);
+    // Usar curl com a URL específica do certificado (se disponível) ou a URL atual da página
+    // Evitar passar a página genérica de login do gov.br (que não tem cert endpoint)
+    const curlTargetUrl = (certHref && certHref !== urlAposCertClick) ? certHref : urlAposCertClick;
+    console.log('[Scraper] PASSO 4: URL para curl:', curlTargetUrl);
+    const callbackUrl = await this.authenticateWithCurl(curlTargetUrl, ssoCookies);
 
     if (callbackUrl && !callbackUrl.includes('sso.acesso.gov.br') && callbackUrl.includes('gov.br')) {
       console.log('[Scraper] PASSO 4: ✓ curl autenticou! Navegando para callback:', callbackUrl);
@@ -755,19 +802,19 @@ class ESocialIRRFScraper {
         lastUrl = currentUrl;
       }
 
-      // Tentar interagir com UI de seleção de certificado que possa ter aparecido
+      // Tentar interagir com UI de seleção de certificado — APENAS botões específicos de cert
+      // NÃO clicar em "continuar" ou "entrar" genéricos (são do formulário de CPF do gov.br)
       try {
         const interacted = await this.page.evaluate(() => {
-          // Textos de botões que podem aparecer após clicar em "Seu certificado digital"
-          const actionTexts = [
-            'selecionar', 'usar certificado', 'confirmar', 'continuar',
-            'prosseguir', 'entrar', 'ok', 'aceitar', 'assinar'
+          const certTexts = [
+            'selecionar certificado', 'usar certificado', 'confirmar certificado',
+            'assinar', 'seu certificado digital', 'certificado digital'
           ];
           const candidates = Array.from(document.querySelectorAll('button, a, input[type="submit"], [role="button"]'));
           for (const el of candidates) {
             const text = (el.textContent || el.value || '').trim().toLowerCase();
             const rect = el.getBoundingClientRect();
-            if (rect.width > 0 && rect.height > 0 && actionTexts.some(t => text.includes(t))) {
+            if (rect.width > 0 && rect.height > 0 && certTexts.some(t => text.includes(t))) {
               console.log('[Scraper] PASSO 4: clicando em botão de certificado:', text);
               el.click();
               return text;
@@ -825,6 +872,35 @@ class ESocialIRRFScraper {
     }
     
     console.log('[Scraper] === LOGIN CONCLUÍDO COM SUCESSO ===');
+  }
+
+  /**
+   * Extrai o CPF do certificado PFX (campo CN do subject ou SAN do ICP-Brasil)
+   */
+  extractCpfFromCert() {
+    try {
+      const forge = require('node-forge');
+      const pfx = forge.pkcs12.pkcs12FromAsn1(
+        forge.asn1.fromDer(forge.util.decode64(this.certificatePfxBase64)), false, this.password
+      );
+      const certBags = pfx.getBags({ bagType: forge.pki.oids.certBag });
+      const cert = certBags[forge.pki.oids.certBag]?.[0]?.cert;
+      if (!cert) return null;
+
+      // Tentar extrair do CN (comum em ICP-Brasil: "NOME:CPF")
+      const cn = cert.subject.getField('CN')?.value || '';
+      const cpfMatch = cn.match(/(\d{11})/);
+      if (cpfMatch) return cpfMatch[1];
+
+      // Tentar no serialNumber
+      const serial = cert.subject.getField('serialNumber')?.value || '';
+      const serialCpf = serial.match(/(\d{11})/);
+      if (serialCpf) return serialCpf[1];
+
+      return null;
+    } catch {
+      return null;
+    }
   }
 
   /**
