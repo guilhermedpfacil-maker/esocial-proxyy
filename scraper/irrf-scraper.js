@@ -1,67 +1,29 @@
 /**
  * eSocial IRRF Scraper
- * 
+ *
  * Automatiza a navegação no portal eSocial para consultar IRRF por trabalhador
  * Fluxo: Folha de Pagamento > Totalizadores > Trabalhador > IRRF por trabalhador
+ *
+ * Usa playwright-core com clientCertificates para autenticação mTLS nativa
+ * (não depende do NSS database do Chrome)
  */
 
-// ========== VERSÃO DO SCRAPER ==========
-const SCRAPER_VERSION = 'v2.2.0-download-fix-2025';
+const SCRAPER_VERSION = 'v2.3.0-playwright-mtls-2025';
 
-const puppeteer = require('puppeteer-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+const { chromium } = require('playwright-core');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { execSync } = require('child_process');
 
-puppeteer.use(StealthPlugin());
-
-// Helper function to replace deprecated waitForTimeout
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// Seletores CSS do portal eSocial (apenas seletores CSS válidos)
 const SELECTORS = {
-  // Login - seletores CSS válidos apenas
-  loginCertificado: 'button[data-option="certificado"], .btn-certificado, #btn-certificado, .certificate-login',
-  
-  // Menu de navegação
-  menuFolhaPagamento: '[data-menu="folha-pagamento"], a[href*="folha"], .menu-folha',
-  submenuTotalizadores: 'a[href*="totalizadores"], .submenu-totalizadores',
-  submenuTrabalhador: 'a[href*="trabalhador"], .submenu-trabalhador',
-  optionIRRF: 'a[href*="irrf"], .option-irrf-trabalhador',
-  
-  // Formulário de pesquisa IRRF
   inputPeriodo: '#periodo, input[name="periodo"], input[id*="periodo"], input[placeholder*="Período"]',
   inputCPF: '#cpf, input[name="cpf"], input[id*="cpf"], input[placeholder*="CPF"]',
-  btnPesquisar: 'button[type="submit"], .btn-pesquisar, input[type="submit"]',
-  
-  // Resultado
-  resultadoContainer: '.resultado-consulta, .informacoes-demonstrativo, .dados-irrf, table.resultado',
-  btnBaixarXML: '.btn-baixar-xml, a[href*="download"], button[id*="xml"], a[id*="xml"]',
-  btnVoltar: '.btn-voltar, a[href*="voltar"], button[id*="voltar"]',
-  
-  // Mensagens
-  msgSemDados: '.msg-sem-dados, .alert-info, .no-data',
-  msgErro: '.msg-erro, .alert-danger, .error-message'
 };
 
-// Helper function to find element by text content (replacement for :contains())
-async function findElementByText(page, text, tagSelector = '*') {
-  return await page.evaluateHandle((text, tagSelector) => {
-    const elements = document.querySelectorAll(tagSelector);
-    for (const el of elements) {
-      if (el.textContent && el.textContent.includes(text)) {
-        return el;
-      }
-    }
-    return null;
-  }, text, tagSelector);
-}
-
-// Helper to click element by text
 async function clickByText(page, text, tagSelector = 'button, a, input[type="submit"]') {
-  const clicked = await page.evaluate((text, tagSelector) => {
+  return await page.evaluate((text, tagSelector) => {
     const elements = document.querySelectorAll(tagSelector);
     for (const el of elements) {
       if (el.textContent && el.textContent.toLowerCase().includes(text.toLowerCase())) {
@@ -71,58 +33,44 @@ async function clickByText(page, text, tagSelector = 'button, a, input[type="sub
     }
     return false;
   }, text, tagSelector);
-  return clicked;
 }
 
 async function debugDumpInputs(page, label) {
   try {
     const safeLabel = String(label || 'debug').replace(/[^a-z0-9_-]+/gi, '_').slice(0, 50);
-    const ts = Date.now();
-
-    await page.screenshot({ path: `/tmp/esocial_${safeLabel}_${ts}.png`, fullPage: true });
-
+    await page.screenshot({ path: `/tmp/esocial_${safeLabel}_${Date.now()}.png`, fullPage: true });
     const inputs = await page.$$eval('input, select, textarea', (els) =>
       els.map((el) => {
-        const rect = (el instanceof HTMLElement) ? el.getBoundingClientRect() : null;
-        const isVisible = !!rect && rect.width > 0 && rect.height > 0;
-
+        const rect = el.getBoundingClientRect();
         return {
           tag: el.tagName.toLowerCase(),
           id: el.id || null,
           name: el.getAttribute('name') || null,
-          type: (el instanceof HTMLInputElement) ? (el.getAttribute('type') || 'text') : null,
+          type: el.getAttribute('type') || 'text',
           placeholder: el.getAttribute('placeholder') || null,
-          ariaLabel: el.getAttribute('aria-label') || null,
-          className: (el instanceof HTMLElement) ? el.className : null,
-          isVisible,
+          isVisible: rect.width > 0 && rect.height > 0,
         };
       })
     );
-
     console.log(`[Scraper][Debug] Inputs (${safeLabel}) =`, JSON.stringify(inputs, null, 2));
   } catch (e) {
-    console.log('[Scraper][Debug] Failed to dump inputs:', e?.message || e);
+    console.log('[Scraper][Debug] Failed to dump inputs:', e?.message);
   }
 }
 
 async function findInputHandleByLabel(page, labelIncludes) {
   const handle = await page.evaluateHandle((labelIncludes) => {
     const needle = String(labelIncludes || '').toLowerCase();
-    const labels = Array.from(document.querySelectorAll('label'));
-
-    const matchLabel = labels.find((l) => (l.textContent || '').toLowerCase().includes(needle));
+    const matchLabel = Array.from(document.querySelectorAll('label'))
+      .find((l) => (l.textContent || '').toLowerCase().includes(needle));
     if (!matchLabel) return null;
 
     const forId = matchLabel.getAttribute('for');
-    if (forId) {
-      return document.getElementById(forId);
-    }
+    if (forId) return document.getElementById(forId);
 
-    // label wraps input
     const nested = matchLabel.querySelector('input, select, textarea');
     if (nested) return nested;
 
-    // label followed by input
     let next = matchLabel.nextElementSibling;
     while (next) {
       if (next.matches && next.matches('input, select, textarea')) return next;
@@ -130,37 +78,24 @@ async function findInputHandleByLabel(page, labelIncludes) {
       if (child) return child;
       next = next.nextElementSibling;
     }
-
     return null;
   }, labelIncludes);
 
   const el = handle.asElement();
-  if (!el) {
-    await handle.dispose();
-    return null;
-  }
-
+  if (!el) { await handle.dispose(); return null; }
   return el;
 }
 
 async function getVisibleTextInputs(page) {
   const candidates = await page.$$('input[type="text"], input:not([type]), input[type="tel"], input[type="search"]');
   const visible = [];
-
   for (const h of candidates) {
     try {
       const box = await h.boundingBox();
-      const disabled = await page.evaluate((el) => {
-        const anyEl = el;
-        return !!anyEl.disabled || anyEl.getAttribute?.('aria-disabled') === 'true';
-      }, h);
-
+      const disabled = await page.evaluate(el => !!el.disabled, h);
       if (box && box.width > 0 && box.height > 0 && !disabled) visible.push(h);
-    } catch {
-      // ignore
-    }
+    } catch { /* ignore */ }
   }
-
   return visible;
 }
 
@@ -169,109 +104,58 @@ class ESocialIRRFScraper {
     this.certificatePfxBase64 = certificatePfx;
     this.password = password;
     this.browser = null;
+    this.context = null;
     this.page = null;
     this.tempCertPath = null;
-    this.tempNssDb = null;
     this.tempUserDataDir = null;
+    this.irrfFormUrl = null;
   }
 
   async init() {
-    console.log('[Scraper] Inicializando com suporte a certificado digital...');
+    console.log('[Scraper] Inicializando com Playwright + clientCertificates...');
+    console.log(`[Scraper] VERSÃO: ${SCRAPER_VERSION}`);
     const timestamp = Date.now();
 
-    // ── 1. Salvar PFX ──────────────────────────────────────────────────────
+    const pfxBuffer = Buffer.from(this.certificatePfxBase64, 'base64');
     this.tempCertPath = path.join(os.tmpdir(), `cert_${timestamp}.pfx`);
-    fs.writeFileSync(this.tempCertPath, Buffer.from(this.certificatePfxBase64, 'base64'));
+    fs.writeFileSync(this.tempCertPath, pfxBuffer);
 
-    // ── 2. NSS database em ~/.pki/nssdb (localização padrão do Chrome/Linux) ──
-    const nssDb = path.join(os.homedir(), '.pki', 'nssdb');
-    fs.mkdirSync(nssDb, { recursive: true });
-    this.tempNssDb = nssDb;
-
-    // Inicializar db (ignorar erro se já existir)
-    try { execSync(`certutil -d sql:${nssDb} -N --empty-password`, { stdio: 'pipe', timeout: 30000 }); }
-    catch { /* já existe */ }
-
-    // Importar PFX usando arquivo de senha (suporta caracteres especiais)
-    const passFile = path.join(os.tmpdir(), `pfxpass_${timestamp}.txt`);
-    fs.writeFileSync(passFile, this.password, { encoding: 'utf8' });
-    try {
-      execSync(`pk12util -d sql:${nssDb} -i "${this.tempCertPath}" -w "${passFile}"`, {
-        stdio: 'pipe', timeout: 30000
-      });
-      console.log('[Scraper] ✓ Certificado importado no NSS db:', nssDb);
-    } catch (err) {
-      console.error('[Scraper] Erro pk12util:', err.stderr?.toString() || err.message);
-      throw new Error(`Falha ao importar certificado PFX: ${err.message}`);
-    } finally {
-      try { fs.unlinkSync(passFile); } catch {}
-    }
-
-    // Confirmar importação e obter nickname
-    try {
-      const certList = execSync(`certutil -d sql:${nssDb} -L`, { encoding: 'utf-8', timeout: 10000 });
-      console.log('[Scraper] Certificados no NSS db:\n', certList);
-      const line = certList.split('\n').find(l => l.trim() && !l.startsWith('Certificate') && !l.startsWith('-'));
-      this.certNickname = line ? line.split('  ')[0].trim() : '';
-      console.log('[Scraper] Nickname:', this.certNickname);
-    } catch (e) {
-      console.log('[Scraper] Aviso ao listar certs:', e.message);
-    }
-
-    // ── 3. Política Chrome via JSON (mais confiável que o flag de linha de comando) ──
-    // Chrome lê AutoSelectCertificateForUrls de /etc/opt/chrome/policies/managed/
-    const policyDir = '/etc/opt/chrome/policies/managed';
-    try {
-      fs.mkdirSync(policyDir, { recursive: true });
-      // Formato correto: lista de strings JSON (cada item é um JSON string)
-      const policy = {
-        AutoSelectCertificateForUrls: [
-          '{"pattern":"https://sso.acesso.gov.br","filter":{}}',
-          '{"pattern":"https://[*.]acesso.gov.br","filter":{}}',
-          '{"pattern":"https://[*.]gov.br","filter":{}}',
-          '{"pattern":"https://[*.]esocial.gov.br","filter":{}}'
-        ]
-      };
-      fs.writeFileSync(path.join(policyDir, 'esocial.json'), JSON.stringify(policy, null, 2));
-      console.log('[Scraper] ✓ Política Chrome escrita em', policyDir);
-    } catch (e) {
-      console.log('[Scraper] Aviso: não foi possível escrever política Chrome:', e.message);
-    }
-
-    // ── 4. Lançar browser ──────────────────────────────────────────────────
     this.tempUserDataDir = path.join(os.tmpdir(), `chrome_${timestamp}`);
     fs.mkdirSync(this.tempUserDataDir, { recursive: true });
 
     console.log('[Scraper] DISPLAY:', process.env.DISPLAY);
 
-    this.browser = await puppeteer.launch({
+    this.browser = await chromium.launch({
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome-stable',
       headless: false,
-      userDataDir: this.tempUserDataDir,
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-gpu',
         '--window-size=1920,1080',
-        '--ignore-certificate-errors',
-        // Flag redundante como fallback caso o arquivo de política não seja lido
-        '--auto-select-certificate-for-urls=[{"pattern":"https://sso.acesso.gov.br","filter":{}},{"pattern":"https://[*.]gov.br","filter":{}}]',
       ]
     });
 
-    this.page = await this.browser.newPage();
-    await this.page.setViewport({ width: 1920, height: 1080 });
-    await this.page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+    // clientCertificates: Playwright gerencia mTLS em proxy local — independe do NSS db do Chrome
+    this.context = await this.browser.newContext({
+      viewport: { width: 1920, height: 1080 },
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      clientCertificates: [{
+        url: 'https://sso.acesso.gov.br',
+        pfx: pfxBuffer,
+        passphrase: this.password
+      }]
+    });
+
+    this.page = await this.context.newPage();
     this.page.setDefaultTimeout(30000);
     this.page.setDefaultNavigationTimeout(60000);
     this.page.on('console', msg => {
-      if (msg.type() === 'error' || msg.text().toLowerCase().includes('cert')) {
-        console.log('[Browser]', msg.text());
-      }
+      if (msg.type() === 'error') console.log('[Browser]', msg.text());
     });
 
-    console.log('[Scraper] ✓ Browser inicializado');
+    console.log('[Scraper] ✓ Browser inicializado com certificado digital (Playwright mTLS)');
   }
 
   async login() {
@@ -279,531 +163,234 @@ class ESocialIRRFScraper {
     console.log(`[Scraper] VERSÃO DO SCRAPER: ${SCRAPER_VERSION}`);
     console.log('[Scraper] === INICIANDO FLUXO DE LOGIN ===');
     console.log('[Scraper] ========================================');
-    
+
     // ============================================
     // PASSO 1: Acessar página inicial do eSocial
     // ============================================
     console.log('[Scraper] PASSO 1: Acessando página inicial do eSocial...');
-    await this.page.goto('https://login.esocial.gov.br/login.aspx', { 
-      waitUntil: 'networkidle2' 
-    });
+    await this.page.goto('https://login.esocial.gov.br/login.aspx', { waitUntil: 'networkidle' });
     await sleep(2000);
-    
     await this.page.screenshot({ path: '/tmp/esocial_01_pagina_inicial.png' });
     console.log('[Scraper] Página inicial carregada. URL:', this.page.url());
-    console.log('[Scraper] Título:', await this.page.title());
-    
-    // Listar elementos clicáveis para debug
-    const buttons1 = await this.page.$$eval('button, a, div[role="button"], span[role="button"]', els => 
-      els.map(el => ({ 
-        tag: el.tagName, 
-        text: el.textContent?.trim().substring(0, 60),
-        href: el.getAttribute('href') || null
-      })).filter(e => e.text)
+
+    const buttons1 = await this.page.$$eval('button, a, div[role="button"]', els =>
+      els.map(el => ({ tag: el.tagName, text: el.textContent?.trim().substring(0, 60), href: el.getAttribute('href') || null })).filter(e => e.text)
     );
-    console.log('[Scraper] Elementos clicáveis disponíveis:', JSON.stringify(buttons1.slice(0, 15), null, 2));
-    
+    console.log('[Scraper] Elementos clicáveis:', JSON.stringify(buttons1.slice(0, 15), null, 2));
+
     // ============================================
-    // PASSO 2: Clicar em link SSO para sso.acesso.gov.br
-    // CRÍTICO: NÃO podemos cair em www.gov.br (portal genérico)
+    // PASSO 2: Clicar em link SSO (sso.acesso.gov.br)
     // ============================================
-    console.log('[Scraper] PASSO 2: Procurando link SSO (sso.acesso.gov.br ou acesso.gov.br)...');
-    console.log('[Scraper] PASSO 2: REGRA CRÍTICA - Deve ir para SSO, NÃO para www.gov.br!');
-    
-    // Primeiro, capturar TODOS os links da página para diagnóstico
-    const allPageLinks = await this.page.$$eval('a', els => 
+    console.log('[Scraper] PASSO 2: Procurando link SSO...');
+
+    const allPageLinks = await this.page.$$eval('a', els =>
       els.map(el => ({
         href: el.getAttribute('href') || '',
         text: (el.textContent || '').trim().substring(0, 50),
-        isSSO: (el.getAttribute('href') || '').includes('sso.acesso.gov.br') || 
-               (el.getAttribute('href') || '').includes('acesso.gov.br'),
-        isPortalGenerico: (el.getAttribute('href') || '').includes('www.gov.br') && 
-                          !(el.getAttribute('href') || '').includes('sso.acesso')
+        isSSO: (el.getAttribute('href') || '').includes('sso.acesso.gov.br') || (el.getAttribute('href') || '').includes('acesso.gov.br'),
       })).filter(l => l.href.includes('gov'))
     );
-    console.log('[Scraper] PASSO 2: Links gov.br encontrados:', JSON.stringify(allPageLinks.slice(0, 10), null, 2));
-    
-    // ESTRATÉGIA 1 (PRIORIDADE MÁXIMA): Buscar link com href direto para SSO
+    console.log('[Scraper] Links gov.br:', JSON.stringify(allPageLinks.slice(0, 10), null, 2));
+
+    // Estratégia 1: Link direto para SSO
     let govBrClicked = await this.page.evaluate(() => {
-      const candidates = Array.from(document.querySelectorAll('a'));
-      
-      // Filtrar APENAS links que vão para o SSO correto
-      const ssoLinks = candidates.filter(el => {
+      const ssoLinks = Array.from(document.querySelectorAll('a')).filter(el => {
         const href = el.getAttribute('href') || '';
-        // DEVE conter sso.acesso.gov.br OU acesso.gov.br (sem www.gov.br)
-        const isValidSSO = href.includes('sso.acesso.gov.br') || 
-                          (href.includes('acesso.gov.br') && !href.includes('www.gov.br'));
-        // NÃO pode ser link para portal genérico www.gov.br
-        const isPortalGenerico = href.includes('www.gov.br') && !href.includes('sso.acesso');
-        
-        return isValidSSO && !isPortalGenerico;
+        return (href.includes('sso.acesso.gov.br') || (href.includes('acesso.gov.br') && !href.includes('www.gov.br')));
       });
-      
-      console.log('[Scraper] PASSO 2 - Links SSO válidos encontrados:', ssoLinks.length);
-      
       if (ssoLinks.length > 0) {
-        // Preferir links com texto "Entrar" ou "gov.br"
-        const withEntrar = ssoLinks.find(el => {
+        const best = ssoLinks.find(el => {
           const text = (el.textContent || '').toLowerCase();
           return text.includes('entrar') || text.includes('gov.br');
-        });
-        
-        const linkToClick = withEntrar || ssoLinks[0];
-        const href = linkToClick.getAttribute('href');
-        const text = linkToClick.textContent?.trim().substring(0, 50);
-        
-        console.log('[Scraper] PASSO 2 - Clicando em link SSO:', { href, text });
-        linkToClick.click();
-        return { clicked: true, method: 'direct-sso-link', href, text };
+        }) || ssoLinks[0];
+        best.click();
+        return { clicked: true, method: 'direct-sso-link', href: best.getAttribute('href') };
       }
-      
       return null;
     });
-    
-    // ESTRATÉGIA 2: Extrair URL SSO do HTML e navegar diretamente
+
+    // Estratégia 2: URL SSO no HTML
     if (!govBrClicked) {
-      console.log('[Scraper] PASSO 2: Nenhum link SSO direto, buscando URL no HTML...');
-      
       const pageContent = await this.page.content();
-      
-      // Regex para encontrar URLs SSO
       const ssoUrlMatches = pageContent.match(/https:\/\/sso\.acesso\.gov\.br[^"'\s]*/g) ||
-                           pageContent.match(/https:\/\/acesso\.gov\.br\/authorize[^"'\s]*/g);
-      
+                            pageContent.match(/https:\/\/acesso\.gov\.br\/authorize[^"'\s]*/g);
       if (ssoUrlMatches && ssoUrlMatches.length > 0) {
         const ssoUrl = ssoUrlMatches[0].replace(/&amp;/g, '&');
-        console.log('[Scraper] PASSO 2 - Encontrada URL SSO no HTML:', ssoUrl);
-        
-        // Navegar diretamente para o SSO
-        await this.page.goto(ssoUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+        console.log('[Scraper] PASSO 2: Navegando diretamente para SSO URL:', ssoUrl);
+        await this.page.goto(ssoUrl, { waitUntil: 'networkidle', timeout: 30000 });
         govBrClicked = { clicked: true, method: 'direct-navigation', url: ssoUrl };
       }
     }
-    
-    // ESTRATÉGIA 3: Buscar dentro do container "Acesso GOV.BR" por LINKS (não botões)
+
+    // Estratégia 3: Container "Acesso GOV.BR"
     if (!govBrClicked) {
-      console.log('[Scraper] PASSO 2: Buscando no container "Acesso GOV.BR"...');
-      
       govBrClicked = await this.page.evaluate(() => {
         const containers = document.querySelectorAll('div, section, aside, fieldset, article');
-        
         for (const container of containers) {
           const headers = container.querySelectorAll('h1, h2, h3, h4, h5, h6, legend, strong, span, p');
           let isGovBrBox = false;
-          
           for (const header of headers) {
             const text = (header.textContent || '').toLowerCase().trim();
             if (text.includes('acesso gov') || text === 'gov.br' || text.includes('acesso gov.br')) {
               const rect = container.getBoundingClientRect();
-              if (rect.width < 800 && rect.height < 600 && rect.width > 100) {
-                isGovBrBox = true;
-                break;
-              }
+              if (rect.width < 800 && rect.height < 600 && rect.width > 100) { isGovBrBox = true; break; }
             }
           }
-          
           if (isGovBrBox) {
-            console.log('[Scraper] PASSO 2: Encontrou container "Acesso GOV.BR"');
-            
-            // PRIORIDADE 1: Links com href para SSO
-            const links = container.querySelectorAll('a');
-            for (const link of links) {
+            for (const link of container.querySelectorAll('a')) {
               const href = link.getAttribute('href') || '';
-              if (href.includes('sso.acesso.gov.br') || 
-                  (href.includes('acesso.gov.br') && !href.includes('www.gov.br'))) {
-                console.log('[Scraper] PASSO 2: Clicando em link SSO no container:', href);
+              if (href.includes('sso.acesso.gov.br') || (href.includes('acesso.gov.br') && !href.includes('www.gov.br'))) {
                 link.click();
                 return { clicked: true, method: 'container-sso-link', href };
               }
             }
-            
-            // PRIORIDADE 2: Botão "Entrar com gov.br" (ÚLTIMO RECURSO)
-            const buttons = container.querySelectorAll('button, [role="button"]');
-            for (const btn of buttons) {
+            for (const btn of container.querySelectorAll('button, [role="button"]')) {
               const text = (btn.textContent || '').toLowerCase().trim();
-              if (text.includes('entrar com gov.br') || text.includes('entrar com gov')) {
-                console.log('[Scraper] PASSO 2: AVISO - Usando botão como último recurso:', btn.textContent?.trim());
+              if (text.includes('entrar com gov')) {
                 btn.click();
                 return { clicked: true, method: 'container-button-fallback', text: btn.textContent?.trim() };
               }
             }
           }
         }
-        
         return null;
       });
     }
-    
-    // ESTRATÉGIA 4: Último recurso - botão por texto
+
+    // Estratégia 4: Último recurso por texto
     if (!govBrClicked) {
-      console.log('[Scraper] PASSO 2 - ÚLTIMO RECURSO: buscando botão por texto...');
       const textClicked = await clickByText(this.page, 'Entrar com gov.br', 'a, button');
-      if (textClicked) {
-        govBrClicked = { clicked: true, method: 'text-fallback-LAST-RESORT' };
-      }
+      if (textClicked) govBrClicked = { clicked: true, method: 'text-fallback' };
     }
-    
+
     if (!govBrClicked) {
       await this.page.screenshot({ path: '/tmp/esocial_erro_govbr_nao_encontrado.png' });
-      console.log('[Scraper] PASSO 2: FALHA - Nenhum link SSO encontrado');
-      throw new Error('PASSO 2 falhou: Nenhum link para SSO (sso.acesso.gov.br) encontrado na página do eSocial');
+      throw new Error('PASSO 2 falhou: Nenhum link para SSO encontrado');
     }
-    
-    console.log('[Scraper] PASSO 2: Clicou (método:', govBrClicked.method, '). Aguardando redirecionamento...');
-    
-    // DETECTAR NOVA ABA/JANELA (SSO pode abrir em nova aba)
+
+    console.log('[Scraper] PASSO 2: Clicou (método:', govBrClicked.method, '). Aguardando navegação...');
+
+    // Detectar nova aba SSO
     let newPageOpened = false;
-    try {
-      const newTarget = await this.browser.waitForTarget(
-        target => {
-          const url = target.url();
-          return url.includes('sso.acesso.gov.br') || url.includes('acesso.gov.br');
-        },
-        { timeout: 10000 }
-      );
-      
-      if (newTarget) {
-        console.log('[Scraper] PASSO 2: Nova aba detectada para SSO!');
-        const newPage = await newTarget.page();
-        if (newPage && newPage !== this.page) {
+    if (govBrClicked.method !== 'direct-navigation') {
+      const newPagePromise = this.context.waitForEvent('page', { timeout: 10000 }).catch(() => null);
+      try {
+        await this.page.waitForURL(url => !url.includes('login.esocial.gov.br/login.aspx'), { timeout: 15000 });
+      } catch (e) {
+        console.log('[Scraper] PASSO 2: Timeout na navegação, verificando nova aba...');
+      }
+      const newPage = await newPagePromise;
+      if (newPage) {
+        const newUrl = newPage.url();
+        if (newUrl.includes('sso.acesso.gov.br') || newUrl.includes('acesso.gov.br')) {
+          console.log('[Scraper] PASSO 2: Nova aba SSO detectada:', newUrl);
           this.page = newPage;
           await this.page.bringToFront();
           newPageOpened = true;
         }
       }
-    } catch (e) {
-      console.log('[Scraper] PASSO 2: Nenhuma nova aba SSO detectada');
     }
-    
-    // Se não abriu nova aba, aguardar navegação
-    if (!newPageOpened) {
-      try {
-        await this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 });
-      } catch (e) {
-        console.log('[Scraper] PASSO 2: Timeout na navegação, verificando estado...');
-      }
+
+    if (!newPageOpened && govBrClicked.method !== 'direct-navigation') {
+      await sleep(2000);
     }
-    
-    await sleep(2000);
+
     await this.page.screenshot({ path: '/tmp/esocial_02_pagina_apos_clique.png' });
-    
     const urlAposClique = this.page.url();
     console.log('[Scraper] PASSO 2: URL após clique:', urlAposClique);
-    console.log('[Scraper] PASSO 2: Título:', await this.page.title());
-    
-    // ============================================
-    // VALIDAÇÃO CRÍTICA PÓS-CLIQUE
-    // ============================================
-    const isSSO = urlAposClique.includes('sso.acesso.gov.br') || 
-                  urlAposClique.includes('acesso.gov.br');
-    const isPortalGenerico = urlAposClique.includes('www.gov.br') && 
-                             !urlAposClique.includes('sso.acesso');
-    const isEsocialLogado = urlAposClique.includes('esocial.gov.br') && 
-                            !urlAposClique.includes('login.esocial.gov.br/login.aspx');
-    const isAindaLoginEsocial = urlAposClique.includes('login.esocial.gov.br/login.aspx');
-    
-    console.log('[Scraper] PASSO 2 - Validação:', { isSSO, isPortalGenerico, isEsocialLogado, isAindaLoginEsocial });
-    
-    // ERRO: Caiu no portal genérico www.gov.br
+
+    const isPortalGenerico = urlAposClique.includes('www.gov.br') && !urlAposClique.includes('sso.acesso');
     if (isPortalGenerico) {
-      await this.page.screenshot({ path: '/tmp/esocial_ERRO_PORTAL_GENERICO.png' });
-      
-      // Dump de todos os elementos clicáveis para diagnóstico
-      const elementosDisponiveis = await this.page.$$eval('a, button', els => 
-        els.map(el => ({
-          tag: el.tagName,
-          href: el.getAttribute('href')?.substring(0, 80),
-          text: el.textContent?.trim().substring(0, 50)
-        })).slice(0, 30)
-      );
-      console.log('[Scraper] ERRO: Elementos na página errada:', JSON.stringify(elementosDisponiveis, null, 2));
-      
-      throw new Error(`PASSO 2 FALHOU: Redirecionou para portal genérico (${urlAposClique}) em vez do SSO (sso.acesso.gov.br). Método usado: ${govBrClicked.method}`);
+      throw new Error(`PASSO 2 FALHOU: Redirecionou para portal genérico (${urlAposClique})`);
     }
-    
-    // AVISO: Ainda na página de login do eSocial
-    if (isAindaLoginEsocial) {
-      console.log('[Scraper] PASSO 2: AVISO - Ainda na página de login. Tentando retry...');
-      
-      // Retry: buscar link SSO novamente
-      const retryResult = await this.page.evaluate(() => {
-        const ssoLinks = Array.from(document.querySelectorAll('a'));
-        const validLink = ssoLinks.find(el => {
-          const href = el.getAttribute('href') || '';
-          return (href.includes('sso.acesso.gov.br') || href.includes('acesso.gov.br')) &&
-                 !href.includes('www.gov.br');
-        });
-        
-        if (validLink) {
-          const href = validLink.getAttribute('href');
-          validLink.click();
-          return { clicked: true, href };
-        }
-        return null;
-      });
-      
-      if (retryResult) {
-        console.log('[Scraper] PASSO 2 - Retry: clicou em', retryResult.href);
-        await sleep(5000);
-      }
-      
-      // Verificar novamente
-      const urlRetry = this.page.url();
-      if (urlRetry.includes('login.esocial.gov.br/login.aspx')) {
-        await this.page.screenshot({ path: '/tmp/esocial_ERRO_NAO_REDIRECIONOU.png' });
-        throw new Error('PASSO 2 FALHOU: Clique não redirecionou para SSO. Ainda em login.esocial.gov.br');
-      }
-    }
-    
-    // SUCESSO: Está no SSO correto
-    if (isSSO) {
-      console.log('[Scraper] PASSO 2: ✓ SUCESSO - Redirecionou para SSO correto:', urlAposClique);
-    } else if (isEsocialLogado) {
-      console.log('[Scraper] PASSO 2: ✓ SUCESSO - Já logado no eSocial:', urlAposClique);
-    } else {
-      console.log('[Scraper] PASSO 2: AVISO - URL não reconhecida, continuando:', urlAposClique);
-    }
-    
-    // Listar elementos para debug
-    const buttons2 = await this.page.$$eval('a, button, [role="button"], li, [class*="card"], [class*="option"]', els => 
-      els.map(el => ({
-        tag: el.tagName,
-        text: el.textContent?.trim().substring(0, 50),
-        classes: el.className?.substring?.(0, 30) || ''
-      })).filter(e => e.text)
+
+    const buttons2 = await this.page.$$eval('a, button, [role="button"], li, [class*="card"]', els =>
+      els.map(el => ({ tag: el.tagName, text: el.textContent?.trim().substring(0, 50), classes: el.className?.substring?.(0, 30) || '' })).filter(e => e.text)
     );
     console.log('[Scraper] PASSO 2: Elementos disponíveis:', JSON.stringify(buttons2.slice(0, 15), null, 2));
-    
+
     // ============================================
-    // PASSO 3: Clicar em "Seu certificado digital" - APENAS SE ESTIVER NO SSO
+    // PASSO 3: Clicar em "Seu certificado digital"
     // ============================================
-    const urlAntesPasso3 = this.page.url();
-    console.log('[Scraper] PASSO 3: URL antes de buscar certificado:', urlAntesPasso3);
-    
-    // VALIDAÇÃO: Só executar PASSO 3 se estiver no SSO correto
-    const estaNoSSO = urlAntesPasso3.includes('sso.acesso.gov.br') || 
-                      urlAntesPasso3.includes('acesso.gov.br');
-    const estaNoPortalGenerico = urlAntesPasso3.includes('www.gov.br') && 
-                                  !urlAntesPasso3.includes('sso.acesso');
-    
-    if (estaNoPortalGenerico) {
-      await this.page.screenshot({ path: '/tmp/esocial_ERRO_PASSO3_PORTAL_ERRADO.png' });
-      throw new Error(`PASSO 3 ABORTADO: Estamos no portal genérico (${urlAntesPasso3}), não no SSO. O PASSO 2 falhou em redirecionar corretamente.`);
-    }
-    
-    if (!estaNoSSO && !urlAntesPasso3.includes('esocial.gov.br')) {
-      console.log('[Scraper] PASSO 3: AVISO - URL não parece ser SSO nem eSocial:', urlAntesPasso3);
-    }
-    
+    console.log('[Scraper] PASSO 3: URL antes de buscar certificado:', this.page.url());
     console.log('[Scraper] PASSO 3: Procurando opção "Seu certificado digital"...');
 
-    // Verificar se o gov.br exibe campo de CPF na mesma página
-    // Nesse caso, NÃO preencher — usar apenas "Seu certificado digital" diretamente
-    const temCampoCpf = await this.page.evaluate(() => {
-      const inputs = Array.from(document.querySelectorAll('input'));
-      return inputs.some(el => {
-        const t = (el.type || '').toLowerCase();
-        const id = (el.id || '').toLowerCase();
-        const name = (el.name || '').toLowerCase();
-        const ph = (el.placeholder || '').toLowerCase();
-        return (t === 'text' || t === 'tel' || t === 'number') &&
-               (id.includes('cpf') || name.includes('cpf') || ph.includes('cpf'));
-      });
-    });
-    console.log('[Scraper] PASSO 3: Campo CPF visível na página:', temCampoCpf);
-    // O certificado digital já contém o CPF — clicar direto em "Seu certificado digital"
-    // sem preencher o campo CPF (o gov.br aceita certificado sem CPF digitado)
-    
-    // 1. Buscar por seletores conhecidos do gov.br + texto
-    let certClicked = await this.page.evaluate(() => {
-      // Seletores comuns no gov.br para opções de login
-      const selectors = [
-        '[data-testid*="certificado"]',
-        '[data-testid*="certificate"]',
-        '[aria-label*="certificado"]',
-        '.card-certificado',
-        '.option-certificado',
-        'li[class*="certificado"]',
-        'div[class*="certificado"]'
-      ];
-      
-      // Tentar seletores específicos primeiro
-      for (const sel of selectors) {
-        const el = document.querySelector(sel);
-        if (el) {
-          console.log('[Scraper] PASSO 3: Encontrou por seletor:', sel);
-          el.click();
-          return { clicked: true, method: 'selector', selector: sel };
-        }
-      }
-      
-      // Buscar por texto em elementos visíveis
-      const candidates = Array.from(document.querySelectorAll('a, button, div, span, li, label, [role="button"], [class*="card"], [class*="option"]'));
-      
-      const withCert = candidates.filter(el => {
+    // Logar HTML do elemento para debug
+    const certElementInfo = await this.page.evaluate(() => {
+      const texts = ['seu certificado digital', 'certificado digital', 'e-cpf', 'e-cnpj'];
+      const els = Array.from(document.querySelectorAll('a, button, li, div, span, [role="button"], [class*="card"], [class*="option"]'));
+      const match = els.find(el => {
         const text = (el.textContent || '').toLowerCase();
         const rect = el.getBoundingClientRect();
-        const isVisible = rect.width > 0 && rect.height > 0;
-        return isVisible && (
-          text.includes('seu certificado digital') ||
-          text.includes('certificado digital') ||
-          text.includes('e-cpf') ||
-          text.includes('e-cnpj')
-        );
+        return rect.width > 0 && rect.height > 0 && texts.some(t => text.includes(t));
       });
-      
-      // Ordenar por posição (mais acima = provavelmente mais relevante)
-      withCert.sort((a, b) => {
-        const rectA = a.getBoundingClientRect();
-        const rectB = b.getBoundingClientRect();
-        return rectA.top - rectB.top;
-      });
-      
-      console.log('[Scraper] PASSO 3: Candidatos "certificado":', withCert.length);
-      
-      if (withCert.length > 0) {
-        const best = withCert[0];
-        const text = best.textContent?.trim().substring(0, 50);
-        console.log('[Scraper] PASSO 3: Clicando em:', text);
-        best.click();
-        return { clicked: true, method: 'text', text };
+      if (!match) return { found: false };
+      return {
+        found: true,
+        tag: match.tagName,
+        text: match.textContent?.trim().substring(0, 100),
+        href: match.getAttribute('href'),
+        outerHtml: match.outerHTML?.substring(0, 300)
+      };
+    });
+    console.log('[Scraper] PASSO 3: Elemento certificado encontrado:', JSON.stringify(certElementInfo));
+
+    let certClicked = await this.page.evaluate(() => {
+      const selectors = [
+        '[data-testid*="certificado"]', '[data-testid*="certificate"]',
+        '[aria-label*="certificado"]', '.card-certificado', '.option-certificado',
+        'li[class*="certificado"]', 'div[class*="certificado"]'
+      ];
+      for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (el) { el.click(); return { clicked: true, method: 'selector', selector: sel }; }
       }
-      
+
+      const texts = ['seu certificado digital', 'certificado digital', 'e-cpf', 'e-cnpj'];
+      const candidates = Array.from(document.querySelectorAll('a, button, div, span, li, label, [role="button"], [class*="card"], [class*="option"]'))
+        .filter(el => {
+          const text = (el.textContent || '').toLowerCase();
+          const rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0 && texts.some(t => text.includes(t));
+        })
+        .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+
+      if (candidates.length > 0) {
+        candidates[0].click();
+        return { clicked: true, method: 'text', text: candidates[0].textContent?.trim().substring(0, 50) };
+      }
       return null;
     });
-    
+
     if (!certClicked) {
-      // 2. Fallback: clickByText genérico
-      console.log('[Scraper] PASSO 3: Fallback - buscando por texto genérico...');
       const textClicked = await clickByText(this.page, 'certificado', 'a, button, div, span, li, label');
-      if (textClicked) {
-        certClicked = { clicked: true, method: 'fallback-text' };
-      }
+      if (textClicked) certClicked = { clicked: true, method: 'fallback-text' };
     }
-    
+
     if (!certClicked) {
       await this.page.screenshot({ path: '/tmp/esocial_erro_certificado_nao_encontrado.png' });
-      
-      // Dump de opções disponíveis para debug
-      const options = await this.page.$$eval('a, button, li, [class*="card"], [class*="option"]', els =>
-        els.map(el => ({
-          tag: el.tagName,
-          text: el.textContent?.trim().substring(0, 60),
-          classes: el.className?.substring?.(0, 40) || ''
-        })).filter(e => e.text).slice(0, 20)
+      const options = await this.page.$$eval('a, button, li, [class*="card"]', els =>
+        els.map(el => ({ tag: el.tagName, text: el.textContent?.trim().substring(0, 60), classes: el.className?.substring?.(0, 40) || '' })).filter(e => e.text).slice(0, 20)
       );
       console.log('[Scraper] PASSO 3: Opções disponíveis:', JSON.stringify(options, null, 2));
-      
       throw new Error('Opção "Seu certificado digital" não encontrada na página do gov.br');
     }
-    
+
     console.log('[Scraper] PASSO 3: Clicou em certificado digital:', JSON.stringify(certClicked));
 
     // ============================================
-    // PASSO 3b: Interceptar requests para capturar URL exata do endpoint de certificado
+    // PASSO 4: Aguardar autenticação por certificado
+    // Playwright clientCertificates apresenta o certificado automaticamente
+    // no handshake TLS quando o servidor pede — sem precisar do NSS db
     // ============================================
-    const interceptedRequests = [];
-    await this.page.setRequestInterception(true);
-    const reqHandler = (req) => {
-      try {
-        const url = req.url();
-        const method = req.method();
-        interceptedRequests.push({ url, method, isNav: req.isNavigationRequest() });
-        req.continue();
-      } catch {}
-    };
-    this.page.on('request', reqHandler);
-
-    // Clicar novamente para capturar o request (o primeiro clique já ocorreu acima)
-    await this.page.evaluate(() => {
-      const texts = ['seu certificado digital', 'certificado digital'];
-      const els = Array.from(document.querySelectorAll('a, button, li, div, span, [role="button"]'));
-      const match = els.find(el => texts.some(t => (el.textContent || '').toLowerCase().includes(t)));
-      if (match) match.click();
-    });
-
-    await sleep(3000);
-    this.page.off('request', reqHandler);
-    await this.page.setRequestInterception(false).catch(() => {});
-
-    // Filtrar requests relevantes (gov.br, excluindo assets)
-    const relevantReqs = interceptedRequests.filter(r =>
-      r.url.includes('gov.br') &&
-      !r.url.match(/\.(css|js|png|jpg|svg|woff|ico)(\?|$)/)
-    );
-    console.log('[Scraper] PASSO 3b: Requests após clique certificado:', JSON.stringify(relevantReqs));
-
-    // Identificar URL candidata ao endpoint de certificado
-    const certNavReq = relevantReqs.find(r => r.isNav && !r.url.includes('login.esocial'));
-    const certAnyReq = relevantReqs.find(r =>
-      r.url.includes('certificado') || r.url.includes('certificate') || r.url.includes('cert')
-    );
-    const interceptedCertUrl = certNavReq?.url || certAnyReq?.url || null;
-    console.log('[Scraper] PASSO 3b: URL interceptada do cert:', interceptedCertUrl);
-
-    // Extrair authorization_id da URL atual para construir endpoint alternativo
-    const currentSsoUrl = this.page.url();
-    const authIdMatch = currentSsoUrl.match(/authorization_id=([^&]+)/);
-    const authorizationId = authIdMatch ? authIdMatch[1] : null;
-    console.log('[Scraper] PASSO 3b: authorization_id:', authorizationId);
-
-    // Capturar cookies da sessão SSO (necessário para o curl manter o state OAuth)
-    const ssoCookies = await this.page.cookies();
-    console.log('[Scraper] PASSO 3b: Cookies SSO:', ssoCookies.map(c => c.name).join(', '));
-
+    console.log('[Scraper] PASSO 4: Aguardando Playwright apresentar certificado automaticamente...');
     await this.page.screenshot({ path: '/tmp/esocial_04a_apos_cert_click.png' });
 
-    // ============================================
-    // PASSO 4: Tentar múltiplas URLs com curl para achar o endpoint mTLS
-    // ============================================
-    const baseUrl = 'https://sso.acesso.gov.br';
-    const candidateUrls = [
-      interceptedCertUrl,
-      authorizationId ? `${baseUrl}/login/certificado?authorization_id=${authorizationId}` : null,
-      authorizationId ? `${baseUrl}/login/certificate?authorization_id=${authorizationId}` : null,
-      authorizationId ? `${baseUrl}/certificado?authorization_id=${authorizationId}` : null,
-      currentSsoUrl.replace('/login?', '/login/certificado?'),
-    ].filter(Boolean);
-
-    console.log('[Scraper] PASSO 4: Tentando', candidateUrls.length, 'URLs candidatas com curl...');
-
-    let callbackUrl = null;
-    for (const url of candidateUrls) {
-      console.log('[Scraper] PASSO 4: curl →', url);
-      const result = await this.authenticateWithCurl(url, ssoCookies);
-      console.log('[Scraper] PASSO 4: curl ←', result);
-      if (result && !result.includes('sso.acesso.gov.br') && result.includes('gov.br')) {
-        callbackUrl = result;
-        break;
-      }
-    }
-
-    if (callbackUrl && !callbackUrl.includes('sso.acesso.gov.br') && callbackUrl.includes('gov.br')) {
-      console.log('[Scraper] PASSO 4: ✓ curl autenticou! Navegando para callback:', callbackUrl);
-      try {
-        await this.page.goto(callbackUrl, { waitUntil: 'networkidle2', timeout: 60000 });
-        await sleep(2000);
-        await this.page.screenshot({ path: '/tmp/esocial_04b_callback.png' });
-        const urlFinal = this.page.url();
-        console.log('[Scraper] PASSO 4: URL após callback:', urlFinal);
-        if (!urlFinal.includes('login.esocial.gov.br/login.aspx') && !urlFinal.includes('sso.acesso.gov.br')) {
-          console.log('[Scraper] === LOGIN VIA CURL CONCLUÍDO ===');
-          return; // Login bem-sucedido via curl!
-        }
-      } catch (navErr) {
-        console.log('[Scraper] PASSO 4: Erro ao navegar para callback:', navErr.message);
-      }
-    }
-
-    console.log('[Scraper] PASSO 4: curl não retornou callback válido, aguardando Chrome...');
-    console.log('[Scraper] PASSO 4: Aguardando seleção automática de certificado pelo Chrome...');
-    
-    // Loop de verificação: aguardar até 120 segundos para o login completar
     const loginStartTime = Date.now();
-    const maxWaitMs = 120000;
+    const maxWaitMs = 90000;
     let loginCompleted = false;
     let lastUrl = this.page.url();
-    let screenshotCount = 0;
+    let screenshotIdx = 0;
 
     while (Date.now() - loginStartTime < maxWaitMs) {
       await sleep(3000);
@@ -812,12 +399,11 @@ class ESocialIRRFScraper {
       const elapsedSec = Math.round((Date.now() - loginStartTime) / 1000);
       console.log(`[Scraper] PASSO 4 - ${elapsedSec}s: ${currentUrl}`);
 
-      if (screenshotCount < 15) {
-        await this.page.screenshot({ path: `/tmp/esocial_p4_${screenshotCount}_${elapsedSec}s.png` }).catch(() => {});
-        screenshotCount++;
+      if (screenshotIdx < 10) {
+        await this.page.screenshot({ path: `/tmp/esocial_p4_${screenshotIdx}_${elapsedSec}s.png` }).catch(() => {});
+        screenshotIdx++;
       }
 
-      // Verificar se saiu das páginas de login
       const aindaNoLogin = currentUrl.includes('login.esocial.gov.br/login.aspx') ||
                            currentUrl.includes('sso.acesso.gov.br/login') ||
                            currentUrl.includes('sso.acesso.gov.br/authorize');
@@ -832,168 +418,35 @@ class ESocialIRRFScraper {
         lastUrl = currentUrl;
       }
 
-      // Tentar interagir com UI de seleção de certificado — APENAS botões específicos de cert
-      // NÃO clicar em "continuar" ou "entrar" genéricos (são do formulário de CPF do gov.br)
-      try {
-        const interacted = await this.page.evaluate(() => {
-          const certTexts = [
-            'selecionar certificado', 'usar certificado', 'confirmar certificado',
-            'assinar', 'seu certificado digital', 'certificado digital'
-          ];
-          const candidates = Array.from(document.querySelectorAll('button, a, input[type="submit"], [role="button"]'));
-          for (const el of candidates) {
-            const text = (el.textContent || el.value || '').trim().toLowerCase();
-            const rect = el.getBoundingClientRect();
-            if (rect.width > 0 && rect.height > 0 && certTexts.some(t => text.includes(t))) {
-              console.log('[Scraper] PASSO 4: clicando em botão de certificado:', text);
-              el.click();
-              return text;
-            }
-          }
-          return null;
-        });
-        if (interacted) console.log('[Scraper] PASSO 4: Interagiu com:', interacted);
-      } catch {}
-
-      // Log do texto da página para diagnóstico
+      // Log do conteúdo da página para diagnóstico
       try {
         const bodyText = await this.page.evaluate(() => document.body?.innerText?.substring(0, 300) || '');
-        if (bodyText) console.log('[Scraper] PASSO 4 - Página atual:\n', bodyText.replace(/\n+/g, ' | '));
+        if (bodyText) console.log('[Scraper] PASSO 4 - Conteúdo:\n', bodyText.replace(/\n+/g, ' | '));
       } catch {}
     }
-    
+
     await this.page.screenshot({ path: '/tmp/esocial_04_final.png' });
-    
-    if (!loginCompleted) {
-      const totalElapsed = Math.round((Date.now() - loginStartTime) / 1000);
-      console.log(`[Scraper] PASSO 4: Timeout após ${totalElapsed}s aguardando login completar`);
-    }
-    
+
     const finalUrl = this.page.url();
     const finalTitle = await this.page.title();
     console.log('[Scraper] URL final após login:', finalUrl);
     console.log('[Scraper] Título final:', finalTitle);
-    
-    // ============================================
-    // VERIFICAÇÃO: Login foi bem-sucedido?
-    // ============================================
-    
-    // Ainda na página de login do eSocial = falhou
+
     if (finalUrl.includes('login.esocial.gov.br/login.aspx')) {
-      const errorMsgs = await this.page.$$eval('.alert, .error, .msg-erro, [class*="error"], [class*="alert"]', els =>
-        els.map(el => el.textContent?.trim()).filter(Boolean)
+      const errorMsgs = await this.page.$$eval('.alert, .error, .msg-erro, [class*="error"], [class*="alert"]',
+        els => els.map(el => el.textContent?.trim()).filter(Boolean)
       );
-      const debugInfo = {
-        url: finalUrl,
-        title: finalTitle,
-        errorMessages: errorMsgs.slice(0, 5)
-      };
-      console.log('[Scraper] DEBUG - Login falhou:', JSON.stringify(debugInfo));
-      throw new Error(`Login não completado. Ainda na página de login. Debug: ${JSON.stringify(debugInfo)}`);
+      throw new Error(`Login não completado. Ainda na página de login. Erros: ${JSON.stringify(errorMsgs.slice(0, 3))}`);
     }
-    
-    // Ainda na página do gov.br sem ter logado
+
     if (finalUrl.includes('sso.acesso.gov.br') && !finalUrl.includes('authorize')) {
       const pageContent = await this.page.content();
-      const hasLoginForm = pageContent.includes('Seu certificado') || pageContent.includes('senha');
-      if (hasLoginForm) {
+      if (pageContent.includes('Seu certificado') || pageContent.includes('senha')) {
         throw new Error('Login não completado. Ainda na página do gov.br aguardando autenticação.');
       }
     }
-    
+
     console.log('[Scraper] === LOGIN CONCLUÍDO COM SUCESSO ===');
-  }
-
-  /**
-   * Extrai o CPF do certificado PFX (campo CN do subject ou SAN do ICP-Brasil)
-   */
-  extractCpfFromCert() {
-    try {
-      const forge = require('node-forge');
-      const pfx = forge.pkcs12.pkcs12FromAsn1(
-        forge.asn1.fromDer(forge.util.decode64(this.certificatePfxBase64)), false, this.password
-      );
-      const certBags = pfx.getBags({ bagType: forge.pki.oids.certBag });
-      const cert = certBags[forge.pki.oids.certBag]?.[0]?.cert;
-      if (!cert) return null;
-
-      // Tentar extrair do CN (comum em ICP-Brasil: "NOME:CPF")
-      const cn = cert.subject.getField('CN')?.value || '';
-      const cpfMatch = cn.match(/(\d{11})/);
-      if (cpfMatch) return cpfMatch[1];
-
-      // Tentar no serialNumber
-      const serial = cert.subject.getField('serialNumber')?.value || '';
-      const serialCpf = serial.match(/(\d{11})/);
-      if (serialCpf) return serialCpf[1];
-
-      return null;
-    } catch {
-      return null;
-    }
-  }
-
-  /**
-   * Usa curl com certificado PEM para seguir o fluxo OAuth do gov.br.
-   * Retorna a URL de callback do eSocial (com código de autorização).
-   */
-  async authenticateWithCurl(url, cookies = []) {
-    const forge = require('node-forge');
-    const ts = Date.now();
-
-    // Converter PFX → PEM usando node-forge
-    let privateKeyPem, certPem;
-    try {
-      const pfxDer = forge.util.decode64(this.certificatePfxBase64);
-      const pfx = forge.pkcs12.pkcs12FromAsn1(forge.asn1.fromDer(pfxDer), false, this.password);
-      const keyBags = pfx.getBags({ bagType: forge.pki.oids.pkcs8ShroudedKeyBag });
-      const certBags = pfx.getBags({ bagType: forge.pki.oids.certBag });
-      const keyBag  = keyBags[forge.pki.oids.pkcs8ShroudedKeyBag]?.[0];
-      const certBag = certBags[forge.pki.oids.certBag]?.[0];
-      if (!keyBag || !certBag) throw new Error('PFX sem chave privada ou certificado');
-      privateKeyPem = forge.pki.privateKeyToPem(keyBag.key);
-      certPem       = forge.pki.certificateToPem(certBag.cert);
-    } catch (e) {
-      console.error('[Scraper] Erro ao converter PFX para PEM:', e.message);
-      return null;
-    }
-
-    const keyFile  = path.join(os.tmpdir(), `k_${ts}.pem`);
-    const crtFile  = path.join(os.tmpdir(), `c_${ts}.pem`);
-    const ckFile   = path.join(os.tmpdir(), `ck_${ts}.txt`);
-    fs.writeFileSync(keyFile, privateKeyPem, { mode: 0o600 });
-    fs.writeFileSync(crtFile, certPem);
-
-    // Montar header de cookies da sessão SSO do Puppeteer
-    const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
-
-    try {
-      const args = [
-        'curl',
-        `--cert "${crtFile}"`,
-        `--key "${keyFile}"`,
-        '--insecure',           // ignora erros de cert do servidor
-        '-L',                   // segue redirects
-        '-s',                   // silencioso
-        '-o /dev/null',
-        '-w "%{url_effective}"',// imprime URL final
-        '--max-redirs 20',
-        '--connect-timeout 30',
-        '--max-time 60',
-      ];
-      if (cookieHeader) args.push(`-H "Cookie: ${cookieHeader}"`);
-      args.push(`"${url}"`);
-
-      const finalUrl = execSync(args.join(' '), { encoding: 'utf-8', timeout: 70000 }).trim();
-      console.log('[Scraper] curl URL final:', finalUrl);
-      return finalUrl;
-    } catch (e) {
-      console.error('[Scraper] curl erro:', e.message);
-      return null;
-    } finally {
-      try { fs.unlinkSync(keyFile); fs.unlinkSync(crtFile); } catch {}
-      try { fs.unlinkSync(ckFile); } catch {}
-    }
   }
 
   async navigateToIRRF() {
@@ -1011,10 +464,7 @@ class ESocialIRRFScraper {
           if (match) { match.click(); return true; }
           return false;
         }, text);
-        if (clicked) {
-          console.log(`[Scraper] ${stepName}: clicou em "${text}"`);
-          return true;
-        }
+        if (clicked) { console.log(`[Scraper] ${stepName}: clicou em "${text}"`); return true; }
       }
       return false;
     };
@@ -1022,52 +472,40 @@ class ESocialIRRFScraper {
     try {
       await this.page.screenshot({ path: '/tmp/esocial_nav_00_logado.png' });
 
-      // Passo 1: Folha de Pagamento
       const fp = await clickMenuItem(['Folha de Pagamento', 'Folha Pagamento', 'Folha'], 'Menu Folha');
       if (!fp) throw new Error('Menu "Folha de Pagamento" não encontrado');
       await sleep(1500);
       await this.page.screenshot({ path: '/tmp/esocial_nav_01_folha.png' });
 
-      // Passo 2: Totalizadores
       const tot = await clickMenuItem(['Totalizadores', 'Totalizador'], 'Submenu Totalizadores');
       if (!tot) throw new Error('Submenu "Totalizadores" não encontrado');
       await sleep(1500);
       await this.page.screenshot({ path: '/tmp/esocial_nav_02_totalizadores.png' });
 
-      // Passo 3: Trabalhador
       const trab = await clickMenuItem(['Trabalhador'], 'Submenu Trabalhador');
       if (!trab) throw new Error('Submenu "Trabalhador" não encontrado');
       await sleep(1500);
       await this.page.screenshot({ path: '/tmp/esocial_nav_03_trabalhador.png' });
 
-      // Passo 4: IRRF por trabalhador
       const irrf = await clickMenuItem(['IRRF por Trabalhador', 'IRRF por trabalhador', 'IRRF'], 'Opção IRRF');
       if (!irrf) throw new Error('Opção "IRRF por Trabalhador" não encontrada');
       await sleep(2000);
       await this.page.screenshot({ path: '/tmp/esocial_nav_04_irrf.png' });
 
-      // Aguardar formulário carregar e salvar URL para re-uso entre consultas
-      await this.page.waitForFunction(
-        () => document.querySelectorAll('input').length > 0,
-        { timeout: 15000 }
-      );
-
+      await this.page.waitForFunction(() => document.querySelectorAll('input').length > 0, { timeout: 15000 });
       this.irrfFormUrl = this.page.url();
       console.log(`[Scraper] Formulário IRRF carregado. URL: ${this.irrfFormUrl}`);
       await debugDumpInputs(this.page, 'irrf_form');
 
     } catch (error) {
-      console.error('[Scraper] Erro na navegação:', error.message);
       await this.page.screenshot({ path: '/tmp/esocial_nav_error.png' });
       throw new Error(`Falha na navegação ao menu IRRF: ${error.message}`);
     }
   }
 
   async voltarAoFormulario() {
-    // Primeira tentativa: botão Voltar
     const voltarClicked = await this.page.evaluate(() => {
-      const candidates = Array.from(document.querySelectorAll('button, a'));
-      const voltar = candidates.find(el => {
+      const voltar = Array.from(document.querySelectorAll('button, a')).find(el => {
         const t = (el.textContent || '').trim().toLowerCase();
         return t === 'voltar' || t.includes('nova consulta') || t.includes('nova pesquisa');
       });
@@ -1075,19 +513,14 @@ class ESocialIRRFScraper {
       return false;
     });
 
-    if (voltarClicked) {
-      await sleep(1500);
-      return;
-    }
+    if (voltarClicked) { await sleep(1500); return; }
 
-    // Segunda tentativa: navegar para URL salva do formulário
     if (this.irrfFormUrl) {
-      await this.page.goto(this.irrfFormUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+      await this.page.goto(this.irrfFormUrl, { waitUntil: 'networkidle', timeout: 30000 });
       await sleep(1500);
       return;
     }
 
-    // Última tentativa: re-navegar pelo menu
     await this.navigateToIRRF();
   }
 
@@ -1095,33 +528,26 @@ class ESocialIRRFScraper {
     const cpfClean = cpf.replace(/\D/g, '');
     const periodoFormatado = this.formatPeriodo(periodo);
     const cpfFormatado = this.formatCPF(cpf);
-
     console.log(`[Scraper] Consultando CPF ${cpfFormatado} - Período ${periodoFormatado}...`);
 
     try {
-      // Limpar campos de texto visíveis
       await this.page.evaluate(() => {
         const skip = new Set(['hidden', 'submit', 'button', 'checkbox', 'radio', 'file', 'image']);
         document.querySelectorAll('input').forEach(el => {
-          if (!skip.has((el.type || '').toLowerCase())) {
-            try { el.value = ''; } catch {}
-          }
+          if (!skip.has((el.type || '').toLowerCase())) { try { el.value = ''; } catch {} }
         });
       });
 
-      // ---- Localizar campo Período ----
       let periodoEl = await this.page.$(SELECTORS.inputPeriodo);
       if (!periodoEl) periodoEl = await findInputHandleByLabel(this.page, 'Período');
       if (!periodoEl) periodoEl = await findInputHandleByLabel(this.page, 'Periodo');
       if (!periodoEl) periodoEl = await findInputHandleByLabel(this.page, 'Compet');
       if (!periodoEl) periodoEl = await findInputHandleByLabel(this.page, 'Mês');
 
-      // ---- Localizar campo CPF ----
       let cpfEl = await this.page.$(SELECTORS.inputCPF);
       if (!cpfEl) cpfEl = await findInputHandleByLabel(this.page, 'CPF');
       if (!cpfEl) cpfEl = await findInputHandleByLabel(this.page, 'Trabalhador');
 
-      // Fallback por posição: 1º e 2º inputs de texto visíveis
       if (!periodoEl || !cpfEl) {
         const visibles = await getVisibleTextInputs(this.page);
         if (!periodoEl) periodoEl = visibles[0] || null;
@@ -1133,23 +559,17 @@ class ESocialIRRFScraper {
         throw new Error('Campos de Período e/ou CPF não encontrados no formulário');
       }
 
-      // ---- Preencher Período ----
       await periodoEl.click({ clickCount: 3 });
       await periodoEl.type(periodoFormatado, { delay: 60 });
-      console.log(`[Scraper] Período preenchido: ${periodoFormatado}`);
 
-      // ---- Preencher CPF ----
       await cpfEl.click({ clickCount: 3 });
       await cpfEl.type(cpfFormatado, { delay: 60 });
-      console.log(`[Scraper] CPF preenchido: ${cpfFormatado}`);
 
       await this.page.screenshot({ path: `/tmp/esocial_consulta_${cpfClean}_preenchido.png` });
 
-      // ---- Clicar em Pesquisar ----
       const searchClicked = await this.page.evaluate(() => {
         const texts = ['pesquisar', 'consultar', 'buscar', 'pesquisa', 'search'];
-        const candidates = Array.from(document.querySelectorAll('button, input[type="submit"], a'));
-        const match = candidates.find(el => {
+        const match = Array.from(document.querySelectorAll('button, input[type="submit"], a')).find(el => {
           const t = (el.textContent || el.value || '').trim().toLowerCase();
           return texts.some(s => t.includes(s));
         });
@@ -1157,47 +577,27 @@ class ESocialIRRFScraper {
         return false;
       });
 
-      if (!searchClicked) {
-        // Fallback: Enter no campo CPF
-        await cpfEl.press('Enter');
-      }
+      if (!searchClicked) await cpfEl.press('Enter');
 
-      // Aguardar resultado aparecer (tabela, mensagem de sem dados ou erro)
       await sleep(3000);
       await this.page.screenshot({ path: `/tmp/esocial_consulta_${cpfClean}_resultado.png` });
 
-      // ---- Detectar "sem dados" ou erro ----
       const paginaTexto = await this.page.evaluate(() => document.body?.innerText || '');
-      const semDadosTextos = [
-        'sem dados', 'nenhum registro', 'não encontrado', 'nao encontrado',
-        'no records', 'no data', 'sem informação', 'nenhuma informação'
-      ];
-      const ehSemDados = semDadosTextos.some(t => paginaTexto.toLowerCase().includes(t));
-
-      if (ehSemDados) {
+      const semDadosTextos = ['sem dados', 'nenhum registro', 'não encontrado', 'nao encontrado', 'no records', 'no data'];
+      if (semDadosTextos.some(t => paginaTexto.toLowerCase().includes(t))) {
         console.log(`[Scraper] Sem dados para CPF ${cpfFormatado} - ${periodoFormatado}`);
         return { cpf, periodo, success: false, message: 'Sem dados para o período informado' };
       }
 
-      // ---- Tentar baixar XML ----
       const xmlContent = await this.downloadXML();
-
       if (xmlContent) {
         console.log(`[Scraper] XML baixado com sucesso para ${cpfFormatado} - ${periodoFormatado} (${xmlContent.length} bytes)`);
         return { cpf, periodo, success: true, xml: xmlContent };
       }
 
-      // Fallback: extrair dados da tela
       const dadosTela = await this.extractDataFromScreen();
       const temDados = dadosTela && Object.keys(dadosTela).length > 0;
-
-      return {
-        cpf,
-        periodo,
-        success: temDados,
-        dados: dadosTela,
-        message: temDados ? 'Dados extraídos da tela (XML não disponível)' : 'Nenhum dado encontrado'
-      };
+      return { cpf, periodo, success: temDados, dados: dadosTela, message: temDados ? 'Dados extraídos da tela (XML não disponível)' : 'Nenhum dado encontrado' };
 
     } catch (error) {
       console.error(`[Scraper] Erro na consulta ${cpf} - ${periodo}:`, error.message);
@@ -1207,29 +607,19 @@ class ESocialIRRFScraper {
   }
 
   async downloadXML() {
-    // Diretório exclusivo para este download (evita conflitos entre consultas paralelas)
     const downloadDir = path.join(os.tmpdir(), `esocial_dl_${Date.now()}`);
     fs.mkdirSync(downloadDir, { recursive: true });
 
     try {
-      // Configurar CDP para capturar downloads ANTES de clicar
-      const client = await this.page.target().createCDPSession();
-      await client.send('Page.setDownloadBehavior', {
-        behavior: 'allow',
-        downloadPath: downloadDir
-      });
+      const client = await this.context.newCDPSession(this.page);
+      await client.send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath: downloadDir });
 
-      // Procurar botão de download XML por texto (múltiplas variações)
-      const downloadTexts = [
-        'Baixar XML', 'Download XML', 'XML', 'Baixar', 'Download',
-        'baixar xml', 'download xml', 'xml', 'baixar', 'download'
-      ];
-
+      const downloadTexts = ['Baixar XML', 'Download XML', 'XML', 'Baixar', 'Download', 'baixar xml', 'download xml', 'xml', 'baixar', 'download'];
       let downloadClicked = false;
+
       for (const text of downloadTexts) {
         const clicked = await this.page.evaluate((text) => {
-          const candidates = Array.from(document.querySelectorAll('button, a, input[type="button"]'));
-          const match = candidates.find(el => {
+          const match = Array.from(document.querySelectorAll('button, a, input[type="button"]')).find(el => {
             const t = (el.textContent || el.value || '').trim().toLowerCase();
             const rect = el.getBoundingClientRect();
             return t.includes(text.toLowerCase()) && rect.width > 0 && rect.height > 0;
@@ -1237,19 +627,12 @@ class ESocialIRRFScraper {
           if (match) { match.click(); return true; }
           return false;
         }, text);
-
-        if (clicked) {
-          console.log(`[Scraper] Download: clicou em botão "${text}"`);
-          downloadClicked = true;
-          break;
-        }
+        if (clicked) { console.log(`[Scraper] Download: clicou em "${text}"`); downloadClicked = true; break; }
       }
 
-      // Fallback: clicar em links com href que contenham xml ou download
       if (!downloadClicked) {
         downloadClicked = await this.page.evaluate(() => {
-          const links = Array.from(document.querySelectorAll('a[href]'));
-          const match = links.find(a => {
+          const match = Array.from(document.querySelectorAll('a[href]')).find(a => {
             const href = (a.getAttribute('href') || '').toLowerCase();
             return href.includes('xml') || href.includes('download');
           });
@@ -1265,28 +648,19 @@ class ESocialIRRFScraper {
         return null;
       }
 
-      // Aguardar arquivo aparecer no diretório de download (polling até 20s)
       const maxWaitMs = 20000;
       const startTime = Date.now();
-
       while (Date.now() - startTime < maxWaitMs) {
         await sleep(500);
-
         let files;
         try { files = fs.readdirSync(downloadDir); } catch { continue; }
-
-        // Ignorar arquivos .crdownload (download ainda em progresso)
         const completed = files.filter(f => !f.endsWith('.crdownload') && !f.endsWith('.tmp'));
         const inProgress = files.filter(f => f.endsWith('.crdownload'));
-
         if (completed.length > 0 && inProgress.length === 0) {
-          // Preferir arquivos XML; se não houver, pegar o primeiro
           const xmlFiles = completed.filter(f => f.toLowerCase().endsWith('.xml'));
           const target = xmlFiles[0] || completed[0];
-          const filePath = path.join(downloadDir, target);
-
           try {
-            const content = fs.readFileSync(filePath, 'utf-8');
+            const content = fs.readFileSync(path.join(downloadDir, target), 'utf-8');
             console.log(`[Scraper] Download: arquivo "${target}" lido (${content.length} bytes)`);
             fs.rmSync(downloadDir, { recursive: true, force: true });
             return content;
@@ -1309,40 +683,26 @@ class ESocialIRRFScraper {
 
   async extractDataFromScreen() {
     try {
-      // Extrair dados da tabela de resultados
-      const dados = await this.page.evaluate(() => {
+      return await this.page.evaluate(() => {
         const result = {};
-        
-        // Tentar extrair de uma tabela
         const table = document.querySelector('.resultado-consulta table, .dados-irrf table');
         if (table) {
-          const rows = table.querySelectorAll('tr');
-          rows.forEach(row => {
+          table.querySelectorAll('tr').forEach(row => {
             const cells = row.querySelectorAll('td, th');
             if (cells.length >= 2) {
               const label = cells[0].textContent?.trim();
               const value = cells[1].textContent?.trim();
-              if (label && value) {
-                result[label] = value;
-              }
+              if (label && value) result[label] = value;
             }
           });
         }
-        
-        // Tentar extrair de campos específicos
-        const campos = document.querySelectorAll('.campo-valor, .info-field');
-        campos.forEach(campo => {
+        document.querySelectorAll('.campo-valor, .info-field').forEach(campo => {
           const label = campo.querySelector('.label, .field-label')?.textContent?.trim();
           const value = campo.querySelector('.valor, .field-value')?.textContent?.trim();
-          if (label && value) {
-            result[label] = value;
-          }
+          if (label && value) result[label] = value;
         });
-        
         return result;
       });
-      
-      return dados;
     } catch (error) {
       console.error('[Scraper] Data extraction error:', error.message);
       return null;
@@ -1366,7 +726,6 @@ class ESocialIRRFScraper {
         for (const cpf of cpfs) {
           done++;
           console.log(`[Scraper] [${done}/${total}] Consultando CPF ${cpf} - Período ${periodo}...`);
-
           try {
             const result = await this.consultarIRRF(cpf, periodo);
             results.push(result);
@@ -1376,11 +735,8 @@ class ESocialIRRFScraper {
             results.push({ cpf, periodo, success: false, error: error.message });
           }
 
-          // Voltar ao formulário para próxima consulta (exceto na última)
           if (done < total) {
-            try {
-              await this.voltarAoFormulario();
-            } catch (navErr) {
+            try { await this.voltarAoFormulario(); } catch (navErr) {
               console.log('[Scraper] Aviso ao voltar ao formulário:', navErr.message);
             }
             await sleep(1500);
@@ -1397,7 +753,6 @@ class ESocialIRRFScraper {
   }
 
   formatPeriodo(periodo) {
-    // Converte YYYY-MM para MM/YYYY
     if (periodo.includes('-')) {
       const [year, month] = periodo.split('-');
       return `${month}/${year}`;
@@ -1406,49 +761,19 @@ class ESocialIRRFScraper {
   }
 
   formatCPF(cpf) {
-    // Formata CPF para XXX.XXX.XXX-XX
     const numbers = cpf.replace(/\D/g, '');
     return numbers.replace(/(\d{3})(\d{3})(\d{3})(\d{2})/, '$1.$2.$3-$4');
   }
 
   async close() {
-    console.log('[Scraper] Closing browser...');
-    
-    if (this.browser) {
-      await this.browser.close();
-    }
-    
-    // Limpar arquivo de certificado temporário
-    if (this.tempCertPath && fs.existsSync(this.tempCertPath)) {
-      try {
-        fs.unlinkSync(this.tempCertPath);
-        console.log('[Scraper] Temp certificate file removed');
-      } catch (e) {
-        console.log('[Scraper] Could not remove temp cert file:', e.message);
-      }
-    }
-    
-    // Limpar NSS db temporário da sessão
-    if (this.tempNssDb && fs.existsSync(this.tempNssDb)) {
-      try {
-        fs.rmSync(this.tempNssDb, { recursive: true, force: true });
-        console.log('[Scraper] NSS db temporário removido');
-      } catch (e) {
-        console.log('[Scraper] Não foi possível remover NSS db:', e.message);
-      }
-    }
-    
-    // Limpar diretório userDataDir do Chrome
-    if (this.tempUserDataDir && fs.existsSync(this.tempUserDataDir)) {
-      try {
-        fs.rmSync(this.tempUserDataDir, { recursive: true, force: true });
-        console.log('[Scraper] Temp Chrome profile removed');
-      } catch (e) {
-        console.log('[Scraper] Could not remove temp Chrome profile:', e.message);
-      }
-    }
-    
-    console.log('[Scraper] Browser closed');
+    console.log('[Scraper] Fechando browser...');
+    try { if (this.context) await this.context.close(); } catch {}
+    try { if (this.browser) await this.browser.close(); } catch {}
+
+    if (this.tempCertPath) { try { fs.unlinkSync(this.tempCertPath); } catch {} }
+    if (this.tempUserDataDir) { try { fs.rmSync(this.tempUserDataDir, { recursive: true, force: true }); } catch {} }
+
+    console.log('[Scraper] Browser fechado');
   }
 }
 

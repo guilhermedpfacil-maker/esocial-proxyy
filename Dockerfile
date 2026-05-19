@@ -6,18 +6,16 @@ RUN apt-get update \
     && wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/googlechrome-linux-keyring.gpg \
     && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/googlechrome-linux-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list \
     && apt-get update \
-    && apt-get install -y google-chrome-stable fonts-ipafont-gothic fonts-wqy-zenhei fonts-thai-tlwg fonts-kacst fonts-freefont-ttf libxss1 libnss3-tools \
+    && apt-get install -y google-chrome-stable fonts-ipafont-gothic fonts-wqy-zenhei fonts-thai-tlwg fonts-kacst fonts-freefont-ttf libxss1 \
     xvfb \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
-# Configura variaveis do Puppeteer
+# Configura variaveis do Puppeteer/Playwright
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
     PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable \
     DISPLAY=:99
-
-# Criar diretório de políticas do Chrome (para AutoSelectCertificateForUrls)
-RUN mkdir -p /etc/opt/chrome/policies/managed
 
 WORKDIR /app
 COPY package.json ./
