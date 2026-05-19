@@ -176,104 +176,76 @@ class ESocialIRRFScraper {
   }
 
   async init() {
-    console.log('[Scraper] Inicializando Puppeteer com suporte a certificado...');
-
+    console.log('[Scraper] Inicializando com suporte a certificado digital...');
     const timestamp = Date.now();
 
-    // 1. Salvar PFX em arquivo temporário
+    // ── 1. Salvar PFX ──────────────────────────────────────────────────────
     this.tempCertPath = path.join(os.tmpdir(), `cert_${timestamp}.pfx`);
     fs.writeFileSync(this.tempCertPath, Buffer.from(this.certificatePfxBase64, 'base64'));
-    console.log('[Scraper] PFX salvo em:', this.tempCertPath);
 
-    // 2. NSS database — Chrome no Linux lê de ~/.pki/nssdb (localização padrão do sistema)
-    //    Usar um diretório temporário exclusivo por sessão para evitar conflitos
-    const nssDb = path.join(os.tmpdir(), `nssdb_${timestamp}`);
+    // ── 2. NSS database em ~/.pki/nssdb (localização padrão do Chrome/Linux) ──
+    const nssDb = path.join(os.homedir(), '.pki', 'nssdb');
     fs.mkdirSync(nssDb, { recursive: true });
     this.tempNssDb = nssDb;
-    console.log('[Scraper] NSS db:', nssDb);
 
+    // Inicializar db (ignorar erro se já existir)
+    try { execSync(`certutil -d sql:${nssDb} -N --empty-password`, { stdio: 'pipe', timeout: 30000 }); }
+    catch { /* já existe */ }
+
+    // Importar PFX usando arquivo de senha (suporta caracteres especiais)
+    const passFile = path.join(os.tmpdir(), `pfxpass_${timestamp}.txt`);
+    fs.writeFileSync(passFile, this.password, { encoding: 'utf8' });
     try {
-      // Inicializar NSS db vazia
-      execSync(`certutil -d sql:${nssDb} -N --empty-password`, { stdio: 'pipe', timeout: 30000 });
-      console.log('[Scraper] NSS db inicializado');
+      execSync(`pk12util -d sql:${nssDb} -i "${this.tempCertPath}" -w "${passFile}"`, {
+        stdio: 'pipe', timeout: 30000
+      });
+      console.log('[Scraper] ✓ Certificado importado no NSS db:', nssDb);
+    } catch (err) {
+      console.error('[Scraper] Erro pk12util:', err.stderr?.toString() || err.message);
+      throw new Error(`Falha ao importar certificado PFX: ${err.message}`);
+    } finally {
+      try { fs.unlinkSync(passFile); } catch {}
+    }
 
-      // Importar PFX
-      // Usar arquivo de senha para evitar problemas com caracteres especiais no shell
-      const passFile = path.join(os.tmpdir(), `pass_${timestamp}.txt`);
-      fs.writeFileSync(passFile, this.password);
-      try {
-        execSync(`pk12util -d sql:${nssDb} -i "${this.tempCertPath}" -w "${passFile}" -W ""`, {
-          stdio: 'pipe', timeout: 30000
-        });
-      } catch {
-        // Fallback: tentar com -W direto (para senhas simples)
-        const escapedPw = this.password.replace(/'/g, "'\\''");
-        execSync(`pk12util -d sql:${nssDb} -i "${this.tempCertPath}" -W '${escapedPw}'`, {
-          stdio: 'pipe', timeout: 30000
-        });
-      } finally {
-        try { fs.unlinkSync(passFile); } catch {}
-      }
-      console.log('[Scraper] Certificado importado no NSS db');
-
-      // Listar certificados para confirmar
+    // Confirmar importação e obter nickname
+    try {
       const certList = execSync(`certutil -d sql:${nssDb} -L`, { encoding: 'utf-8', timeout: 10000 });
       console.log('[Scraper] Certificados no NSS db:\n', certList);
-
-      // Extrair nickname do certificado importado para uso no auto-select
-      const firstLine = certList.split('\n').find(l => l.trim() && !l.includes('Certificate Nickname'));
-      this.certNickname = firstLine ? firstLine.split('  ')[0].trim() : '';
-      console.log('[Scraper] Nickname do certificado:', this.certNickname);
-
-      // Verificar chave privada
-      try {
-        const passFile2 = path.join(os.tmpdir(), `pass2_${timestamp}.txt`);
-        fs.writeFileSync(passFile2, '');
-        const keys = execSync(`certutil -d sql:${nssDb} -K -f "${passFile2}"`, { encoding: 'utf-8', timeout: 10000 });
-        fs.unlinkSync(passFile2);
-        console.log('[Scraper] Chaves privadas no NSS db:\n', keys);
-      } catch (e) {
-        console.log('[Scraper] Aviso ao listar chaves:', e.message);
-      }
-
-    } catch (error) {
-      console.error('[Scraper] Erro ao configurar NSS:', error.message);
-      try { execSync('certutil --version && pk12util --version', { stdio: 'pipe' }); }
-      catch { throw new Error('libnss3-tools não instalado. Execute: apt-get install -y libnss3-tools'); }
-      throw new Error(`Falha ao importar certificado: ${error.message}`);
+      const line = certList.split('\n').find(l => l.trim() && !l.startsWith('Certificate') && !l.startsWith('-'));
+      this.certNickname = line ? line.split('  ')[0].trim() : '';
+      console.log('[Scraper] Nickname:', this.certNickname);
+    } catch (e) {
+      console.log('[Scraper] Aviso ao listar certs:', e.message);
     }
 
-    // 3. Copiar NSS db para ~/.pki/nssdb — localização que o Chrome no Linux usa nativamente
-    const pkiNssDb = path.join(os.homedir(), '.pki', 'nssdb');
-    fs.mkdirSync(path.join(os.homedir(), '.pki'), { recursive: true });
-    // Remover db anterior se existir e copiar o novo
-    if (fs.existsSync(pkiNssDb)) {
-      fs.rmSync(pkiNssDb, { recursive: true, force: true });
+    // ── 3. Política Chrome via JSON (mais confiável que o flag de linha de comando) ──
+    // Chrome lê AutoSelectCertificateForUrls de /etc/opt/chrome/policies/managed/
+    const policyDir = '/etc/opt/chrome/policies/managed';
+    try {
+      fs.mkdirSync(policyDir, { recursive: true });
+      // Formato correto: lista de strings JSON (cada item é um JSON string)
+      const policy = {
+        AutoSelectCertificateForUrls: [
+          '{"pattern":"https://sso.acesso.gov.br","filter":{}}',
+          '{"pattern":"https://[*.]acesso.gov.br","filter":{}}',
+          '{"pattern":"https://[*.]gov.br","filter":{}}',
+          '{"pattern":"https://[*.]esocial.gov.br","filter":{}}'
+        ]
+      };
+      fs.writeFileSync(path.join(policyDir, 'esocial.json'), JSON.stringify(policy, null, 2));
+      console.log('[Scraper] ✓ Política Chrome escrita em', policyDir);
+    } catch (e) {
+      console.log('[Scraper] Aviso: não foi possível escrever política Chrome:', e.message);
     }
-    // Copiar arquivos do NSS db da sessão para ~/.pki/nssdb
-    fs.mkdirSync(pkiNssDb, { recursive: true });
-    for (const f of fs.readdirSync(nssDb)) {
-      fs.copyFileSync(path.join(nssDb, f), path.join(pkiNssDb, f));
-    }
-    console.log('[Scraper] NSS db copiado para ~/.pki/nssdb');
-    this.pkiNssDb = pkiNssDb;
 
-    // 4. Chrome userDataDir isolado por sessão
+    // ── 4. Lançar browser ──────────────────────────────────────────────────
     this.tempUserDataDir = path.join(os.tmpdir(), `chrome_${timestamp}`);
     fs.mkdirSync(this.tempUserDataDir, { recursive: true });
 
-    // Construir a policy de auto-seleção de certificado
-    // FORMATO CORRETO: array JSON com pattern de URL — não usar "*" puro
-    const autoSelectPolicy = JSON.stringify([
-      { pattern: 'https://sso.acesso.gov.br', filter: {} },
-      { pattern: 'https://[*.]gov.br', filter: {} },
-      { pattern: 'https://[*.]esocial.gov.br', filter: {} }
-    ]);
-
-    console.log('[Scraper] Iniciando browser. DISPLAY:', process.env.DISPLAY);
+    console.log('[Scraper] DISPLAY:', process.env.DISPLAY);
 
     this.browser = await puppeteer.launch({
-      headless: false, // false obrigatório para popup de certificado via Xvfb
+      headless: false,
       userDataDir: this.tempUserDataDir,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
       args: [
@@ -283,37 +255,23 @@ class ESocialIRRFScraper {
         '--disable-gpu',
         '--window-size=1920,1080',
         '--ignore-certificate-errors',
-        '--ignore-certificate-errors-spki-list',
-        // CORREÇÃO PRINCIPAL: formato array JSON com URLs específicas do gov.br
-        `--auto-select-certificate-for-urls=${autoSelectPolicy}`,
-        // Apontar Chrome para o NSS db da sessão
-        `--use-system-default-printer`,
-        '--allow-running-insecure-content',
-      ],
-      env: {
-        ...process.env,
-        // Garantir que NSS_DEFAULT_DB_TYPE está definido para sql
-        NSS_DEFAULT_DB_TYPE: 'sql',
-        // Apontar para o NSS db da sessão via variável de ambiente do NSS
-        SSL_DIR: nssDb,
-      }
+        // Flag redundante como fallback caso o arquivo de política não seja lido
+        '--auto-select-certificate-for-urls=[{"pattern":"https://sso.acesso.gov.br","filter":{}},{"pattern":"https://[*.]gov.br","filter":{}}]',
+      ]
     });
 
     this.page = await this.browser.newPage();
     await this.page.setViewport({ width: 1920, height: 1080 });
-    await this.page.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    );
+    await this.page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
     this.page.setDefaultTimeout(30000);
     this.page.setDefaultNavigationTimeout(60000);
-
     this.page.on('console', msg => {
       if (msg.type() === 'error' || msg.text().toLowerCase().includes('cert')) {
         console.log('[Browser]', msg.text());
       }
     });
 
-    console.log('[Scraper] Browser inicializado com suporte a certificado');
+    console.log('[Scraper] ✓ Browser inicializado');
   }
 
   async login() {
@@ -733,73 +691,68 @@ class ESocialIRRFScraper {
     console.log('[Scraper] Auto-select configurado para qualquer URL que pedir certificado');
     console.log('[Scraper] Se popup aparecer, Chrome deve selecionar automaticamente do NSS database');
     
-    // Loop de verificação: aguardar até 90 segundos para o login completar
+    // Loop de verificação: aguardar até 120 segundos para o login completar
     const loginStartTime = Date.now();
-    const maxWaitMs = 90000; // 90 segundos
+    const maxWaitMs = 120000;
     let loginCompleted = false;
     let lastUrl = this.page.url();
     let screenshotCount = 0;
-    
+
     while (Date.now() - loginStartTime < maxWaitMs) {
       await sleep(3000);
-      
+
       const currentUrl = this.page.url();
       const elapsedSec = Math.round((Date.now() - loginStartTime) / 1000);
-      
-      // Log de progresso a cada verificação
-      console.log(`[Scraper] PASSO 4 - ${elapsedSec}s: URL atual = ${currentUrl}`);
-      
-      // Tirar screenshot periodicamente
-      if (screenshotCount < 10) {
-        await this.page.screenshot({ path: `/tmp/esocial_passo4_${screenshotCount}_${elapsedSec}s.png` });
+      console.log(`[Scraper] PASSO 4 - ${elapsedSec}s: ${currentUrl}`);
+
+      if (screenshotCount < 15) {
+        await this.page.screenshot({ path: `/tmp/esocial_p4_${screenshotCount}_${elapsedSec}s.png` }).catch(() => {});
         screenshotCount++;
       }
-      
-      // Verificar se saiu da página de login
-      if (!currentUrl.includes('login.esocial.gov.br/login.aspx') && 
-          !currentUrl.includes('sso.acesso.gov.br/login') &&
-          !currentUrl.includes('sso.acesso.gov.br/authorize')) {
-        console.log('[Scraper] PASSO 4: URL mudou para fora do login!');
+
+      // Verificar se saiu das páginas de login
+      const aindaNoLogin = currentUrl.includes('login.esocial.gov.br/login.aspx') ||
+                           currentUrl.includes('sso.acesso.gov.br/login') ||
+                           currentUrl.includes('sso.acesso.gov.br/authorize');
+      if (!aindaNoLogin) {
+        console.log('[Scraper] PASSO 4: ✓ Saiu do login! URL:', currentUrl);
         loginCompleted = true;
         break;
       }
-      
-      // Verificar se a URL mudou (pode indicar progresso)
+
       if (currentUrl !== lastUrl) {
-        console.log(`[Scraper] PASSO 4: URL mudou de ${lastUrl} para ${currentUrl}`);
+        console.log(`[Scraper] PASSO 4: URL mudou → ${currentUrl}`);
         lastUrl = currentUrl;
       }
-      
-      // Coletar informações de debug da página
+
+      // Tentar interagir com UI de seleção de certificado que possa ter aparecido
       try {
-        const pageInfo = await this.page.evaluate(() => {
-          const alerts = Array.from(document.querySelectorAll('.alert, .error, .msg-erro, [class*="error"]'))
-            .map(el => el.textContent?.trim()).filter(Boolean).slice(0, 3);
-          const bodyText = document.body?.innerText?.substring(0, 500) || '';
-          return { alerts, bodyPreview: bodyText };
+        const interacted = await this.page.evaluate(() => {
+          // Textos de botões que podem aparecer após clicar em "Seu certificado digital"
+          const actionTexts = [
+            'selecionar', 'usar certificado', 'confirmar', 'continuar',
+            'prosseguir', 'entrar', 'ok', 'aceitar', 'assinar'
+          ];
+          const candidates = Array.from(document.querySelectorAll('button, a, input[type="submit"], [role="button"]'));
+          for (const el of candidates) {
+            const text = (el.textContent || el.value || '').trim().toLowerCase();
+            const rect = el.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0 && actionTexts.some(t => text.includes(t))) {
+              console.log('[Scraper] PASSO 4: clicando em botão de certificado:', text);
+              el.click();
+              return text;
+            }
+          }
+          return null;
         });
-        
-        if (pageInfo.alerts.length > 0) {
-          console.log('[Scraper] PASSO 4 - Mensagens de alerta:', pageInfo.alerts);
-        }
-      } catch (e) {
-        // Ignorar erros de avaliação
-      }
-      
-      // Coletar cookies para debug
+        if (interacted) console.log('[Scraper] PASSO 4: Interagiu com:', interacted);
+      } catch {}
+
+      // Log do texto da página para diagnóstico
       try {
-        const cookies = await this.page.cookies();
-        const authCookies = cookies.filter(c => 
-          c.name.toLowerCase().includes('session') || 
-          c.name.toLowerCase().includes('token') ||
-          c.name.toLowerCase().includes('auth')
-        );
-        if (authCookies.length > 0) {
-          console.log('[Scraper] PASSO 4 - Cookies de auth encontrados:', authCookies.map(c => c.name));
-        }
-      } catch (e) {
-        // Ignorar erros
-      }
+        const bodyText = await this.page.evaluate(() => document.body?.innerText?.substring(0, 300) || '');
+        if (bodyText) console.log('[Scraper] PASSO 4 - Página atual:\n', bodyText.replace(/\n+/g, ' | '));
+      } catch {}
     }
     
     await this.page.screenshot({ path: '/tmp/esocial_04_final.png' });

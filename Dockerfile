@@ -16,6 +16,9 @@ ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
     PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable \
     DISPLAY=:99
 
+# Criar diretório de políticas do Chrome (para AutoSelectCertificateForUrls)
+RUN mkdir -p /etc/opt/chrome/policies/managed
+
 WORKDIR /app
 COPY package.json ./
 RUN npm install --omit=dev
