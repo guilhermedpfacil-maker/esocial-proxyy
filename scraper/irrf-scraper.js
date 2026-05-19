@@ -291,11 +291,16 @@ class ESocialIRRFScraper {
       }
     }
 
-    // Aguardar a página estabilizar (o /authorize redireciona para /login automaticamente)
+    // Aguardar a página estabilizar (o /authorize redireciona para /login?authorization_id=... automaticamente)
+    // Precisamos esperar até o authorization_id aparecer na URL antes de continuar
     try {
-      await this.page.waitForLoadState('networkidle', { timeout: 15000 });
-    } catch {}
-    await sleep(2000);
+      await this.page.waitForURL(url => url.includes('authorization_id='), { timeout: 30000 });
+      console.log('[Scraper] PASSO 2: URL com authorization_id:', this.page.url());
+    } catch {
+      // Se não apareceu o authorization_id, aguardar networkidle como fallback
+      try { await this.page.waitForLoadState('networkidle', { timeout: 15000 }); } catch {}
+    }
+    await sleep(1000);
 
     await this.page.screenshot({ path: '/tmp/esocial_02_pagina_apos_clique.png' });
     const urlAposClique = this.page.url();
