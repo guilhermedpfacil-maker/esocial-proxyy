@@ -8,7 +8,7 @@
  */
 
 // ========== VERSÃO DO PROXY ==========
-const PROXY_VERSION = 'v2.1.0-sso-fix-2024-12-31';
+const PROXY_VERSION = 'v2.2.0-certificate-management-2025';
 console.log(`[eSocial Proxy] ========================================`);
 console.log(`[eSocial Proxy] VERSÃO: ${PROXY_VERSION}`);
 console.log(`[eSocial Proxy] Build: ${new Date().toISOString()}`);
@@ -18,6 +18,7 @@ const express = require('express');
 const https = require('https');
 const cors = require('cors');
 const { ESocialIRRFScraper } = require('./scraper/irrf-scraper');
+const certStore = require('./certificates');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -45,7 +46,7 @@ app.use(cors({
     callback(null, true); // Allow all origins for now (proxy is public anyway)
   },
   credentials: true,
-  methods: ['GET', 'POST', 'OPTIONS'],
+  methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 }));
 
@@ -95,8 +96,88 @@ const ESOCIAL_URLS = {
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    version: PROXY_VERSION,
+    certificates: certStore.listCertificates().length
+  });
 });
+
+// ============================================================
+// GERENCIAMENTO DE CERTIFICADOS DIGITAIS
+// ============================================================
+
+/**
+ * POST /api/certificates
+ * Cadastra ou atualiza o certificado digital de uma empresa
+ * Body: { cnpj, nome?, certificatePfx (base64), password }
+ */
+app.post('/api/certificates', rateLimit, (req, res) => {
+  try {
+    const { cnpj, nome, certificatePfx, password } = req.body;
+
+    if (!cnpj) {
+      return res.status(400).json({ success: false, error: 'CNPJ é obrigatório' });
+    }
+    if (!certificatePfx) {
+      return res.status(400).json({ success: false, error: 'certificatePfx (base64) é obrigatório' });
+    }
+    if (!password) {
+      return res.status(400).json({ success: false, error: 'Senha do certificado é obrigatória' });
+    }
+
+    const result = certStore.addCertificate({ cnpj, nome, certificatePfx, password });
+    console.log(`[Certificates] Certificado cadastrado para CNPJ ${result.cnpj} (${result.nome})`);
+
+    res.json({
+      success: true,
+      message: 'Certificado cadastrado com sucesso',
+      empresa: result
+    });
+  } catch (error) {
+    console.error('[Certificates] Erro ao cadastrar:', error.message);
+    res.status(400).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * GET /api/certificates
+ * Lista todas as empresas com certificado cadastrado (sem dados sensíveis)
+ */
+app.get('/api/certificates', (req, res) => {
+  const empresas = certStore.listCertificates();
+  res.json({ success: true, total: empresas.length, empresas });
+});
+
+/**
+ * GET /api/certificates/:cnpj
+ * Retorna informações de uma empresa específica (sem dados sensíveis)
+ */
+app.get('/api/certificates/:cnpj', (req, res) => {
+  const cnpjClean = req.params.cnpj.replace(/\D/g, '');
+  const cert = certStore.getCertificate(cnpjClean);
+  if (!cert) {
+    return res.status(404).json({ success: false, error: 'Empresa não encontrada' });
+  }
+  const { cnpj, nome, addedAt, updatedAt } = cert;
+  res.json({ success: true, empresa: { cnpj, nome, addedAt, updatedAt } });
+});
+
+/**
+ * DELETE /api/certificates/:cnpj
+ * Remove o certificado de uma empresa
+ */
+app.delete('/api/certificates/:cnpj', rateLimit, (req, res) => {
+  const cnpjClean = req.params.cnpj.replace(/\D/g, '');
+  const removed = certStore.deleteCertificate(cnpjClean);
+  if (!removed) {
+    return res.status(404).json({ success: false, error: 'Empresa não encontrada' });
+  }
+  console.log(`[Certificates] Certificado removido para CNPJ ${cnpjClean}`);
+  res.json({ success: true, message: 'Certificado removido com sucesso' });
+});
+
 
 // ============================================================
 // NOVO ENDPOINT: Web Scraping para IRRF por trabalhador
@@ -105,27 +186,40 @@ app.post('/api/esocial-irrf', rateLimit, async (req, res) => {
   const startTime = Date.now();
   
   try {
-    const { certificatePfx, password, cpfs, periodos } = req.body;
+    let { cnpj, certificatePfx, password, cpfs, periodos } = req.body;
 
-    // Validação
+    // Resolve certificado via CNPJ cadastrado ou PFX direto
+    if (cnpj && !certificatePfx) {
+      const stored = certStore.getCertificate(cnpj);
+      if (!stored) {
+        return res.status(404).json({
+          success: false,
+          error: `Nenhum certificado cadastrado para o CNPJ ${cnpj}. Use POST /api/certificates para cadastrar.`
+        });
+      }
+      certificatePfx = stored.certificatePfx;
+      password = stored.password;
+      console.log(`[eSocial IRRF] Usando certificado cadastrado para CNPJ ${stored.cnpj} (${stored.nome})`);
+    }
+
     if (!certificatePfx || !password) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Certificado digital (certificatePfx) e senha são obrigatórios' 
+      return res.status(400).json({
+        success: false,
+        error: 'Forneça cnpj (empresa cadastrada) ou certificatePfx + password'
       });
     }
 
     if (!cpfs || !Array.isArray(cpfs) || cpfs.length === 0) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Lista de CPFs é obrigatória' 
+      return res.status(400).json({
+        success: false,
+        error: 'Lista de CPFs é obrigatória'
       });
     }
 
     if (!periodos || !Array.isArray(periodos) || periodos.length === 0) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Lista de períodos é obrigatória' 
+      return res.status(400).json({
+        success: false,
+        error: 'Lista de períodos é obrigatória'
       });
     }
 
@@ -197,22 +291,46 @@ app.post('/api/esocial', rateLimit, async (req, res) => {
   const startTime = Date.now();
   
   try {
-    const { 
-      action, 
-      ambiente, 
-      privateKeyPem, 
-      certificatePem, 
-      tpInsc, 
-      nrInsc, 
-      perApur, 
-      tpEvento 
+    let {
+      action,
+      ambiente,
+      cnpj,
+      privateKeyPem,
+      certificatePem,
+      tpInsc,
+      nrInsc,
+      perApur,
+      tpEvento
     } = req.body;
 
-    // Validação de payload
+    // Resolve certificado via CNPJ cadastrado (converte PFX → PEM) ou PEM direto
+    if (cnpj && !privateKeyPem) {
+      const stored = certStore.getCertificate(cnpj);
+      if (!stored) {
+        return res.status(404).json({
+          success: false,
+          error: `Nenhum certificado cadastrado para o CNPJ ${cnpj}. Use POST /api/certificates para cadastrar.`
+        });
+      }
+      try {
+        const pem = certStore.pfxToPem(stored.certificatePfx, stored.password);
+        privateKeyPem = pem.privateKeyPem;
+        certificatePem = pem.certificatePem;
+        if (!nrInsc) nrInsc = stored.cnpj;
+        if (!tpInsc) tpInsc = '2'; // CNPJ
+        console.log(`[eSocial Proxy] Usando certificado cadastrado para CNPJ ${stored.cnpj} (${stored.nome})`);
+      } catch (convErr) {
+        return res.status(400).json({
+          success: false,
+          error: `Erro ao converter certificado PFX: ${convErr.message}`
+        });
+      }
+    }
+
     if (!privateKeyPem || !certificatePem) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Certificado digital (privateKeyPem e certificatePem) é obrigatório' 
+      return res.status(400).json({
+        success: false,
+        error: 'Forneça cnpj (empresa cadastrada) ou privateKeyPem + certificatePem'
       });
     }
 
@@ -393,6 +511,12 @@ app.listen(PORT, () => {
   console.log(`[eSocial Proxy] Server running on port ${PORT}`);
   console.log(`[eSocial Proxy] Health check: http://localhost:${PORT}/health`);
   console.log(`[eSocial Proxy] API endpoints:`);
-  console.log(`  - POST http://localhost:${PORT}/api/esocial (mTLS direto)`);
-  console.log(`  - POST http://localhost:${PORT}/api/esocial-irrf (Web Scraping IRRF)`);
+  console.log(`  Certificados:`);
+  console.log(`    POST   /api/certificates          - Cadastrar certificado de empresa`);
+  console.log(`    GET    /api/certificates          - Listar empresas cadastradas`);
+  console.log(`    GET    /api/certificates/:cnpj    - Consultar empresa`);
+  console.log(`    DELETE /api/certificates/:cnpj    - Remover certificado`);
+  console.log(`  eSocial:`);
+  console.log(`    POST   /api/esocial               - mTLS direto (aceita cnpj ou PEM)`);
+  console.log(`    POST   /api/esocial-irrf          - Web Scraping IRRF (aceita cnpj ou PFX)`);
 });
