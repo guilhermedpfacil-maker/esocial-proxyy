@@ -8,7 +8,7 @@
  * (não depende do NSS database do Chrome)
  */
 
-const SCRAPER_VERSION = 'v2.4.0-mtls-nodejs-direct-2025';
+const SCRAPER_VERSION = 'v2.5.0-stealth-real-hcaptcha-2025';
 
 const { chromium } = require('playwright-core');
 const https = require('https');
@@ -227,7 +227,73 @@ class ESocialIRRFScraper {
       if (msg.type() === 'error') console.log('[Browser]', msg.text());
     });
 
-    console.log('[Scraper] ✓ Browser inicializado com certificado digital (Playwright mTLS)');
+    // Scripts de stealth para evitar detecção de automação pelo hcaptcha.
+    // Rodam ANTES de qualquer JS da página — inclusive antes do hcaptcha carregar.
+    // O principal sinal é navigator.webdriver = true (setado por Playwright por padrão).
+    await this.context.addInitScript(() => {
+      // 1. Remover o sinal mais óbvio de automação
+      Object.defineProperty(navigator, 'webdriver', { get: () => false });
+
+      // 2. Simular plugins de Chrome real (headless/automation tem 0 plugins)
+      const makePlugin = (name, filename, desc, mimes) => {
+        const plugin = { name, filename, description: desc, length: mimes.length };
+        mimes.forEach((m, i) => { plugin[i] = m; });
+        plugin.item = i => plugin[i];
+        plugin.namedItem = n => mimes.find(m => m.type === n) || null;
+        return plugin;
+      };
+      const fakePlugins = [
+        makePlugin('PDF Viewer', 'internal-pdf-viewer', 'Portable Document Format', [
+          { type: 'application/pdf', suffixes: 'pdf', description: '' },
+          { type: 'text/pdf', suffixes: 'pdf', description: '' },
+        ]),
+        makePlugin('Chrome PDF Viewer', 'internal-pdf-viewer', '', [
+          { type: 'application/pdf', suffixes: 'pdf', description: '' },
+        ]),
+        makePlugin('Native Client', 'internal-nacl-plugin', '', [
+          { type: 'application/x-nacl', suffixes: '', description: 'Native Client Executable' },
+          { type: 'application/x-pnacl', suffixes: '', description: 'Portable Native Client Executable' },
+        ]),
+      ];
+      Object.defineProperty(navigator, 'plugins', {
+        get: () => Object.assign(fakePlugins, {
+          item: i => fakePlugins[i] || null,
+          namedItem: n => fakePlugins.find(p => p.name === n) || null,
+          refresh: () => {},
+          length: fakePlugins.length
+        })
+      });
+
+      // 3. Idiomas em português (Brasil)
+      Object.defineProperty(navigator, 'languages', { get: () => ['pt-BR', 'pt', 'en-US', 'en'] });
+
+      // 4. Objeto window.chrome (ausente em ambientes headless sem stealth)
+      if (!window.chrome) {
+        window.chrome = {
+          runtime: { connect: () => {}, sendMessage: () => {}, onMessage: { addListener: () => {} } },
+          loadTimes: () => ({ firstPaintTime: 0.5, firstPaintAfterLoadTime: 0 }),
+          csi: () => ({ startE: Date.now() - 1000, onloadT: Date.now(), pageT: 1000, tpiT: 100 }),
+          app: { isInstalled: false, getDetails: () => null, getIsInstalled: () => false },
+        };
+      }
+
+      // 5. Permissions API (evitar detecção via permissions.query)
+      if (navigator.permissions && navigator.permissions.query) {
+        const origQuery = navigator.permissions.query.bind(navigator.permissions);
+        navigator.permissions.query = params =>
+          params.name === 'notifications'
+            ? Promise.resolve({ state: 'denied', onchange: null })
+            : origQuery(params);
+      }
+
+      // 6. Hardware concurrency e memória realistas
+      Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 4 });
+      if ('deviceMemory' in navigator) {
+        Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+      }
+    });
+
+    console.log('[Scraper] ✓ Browser inicializado com certificado digital (Playwright mTLS + stealth)');
   }
 
   async login() {
@@ -236,81 +302,21 @@ class ESocialIRRFScraper {
     console.log('[Scraper] === INICIANDO FLUXO DE LOGIN ===');
     console.log('[Scraper] ========================================');
 
-    // Interceptar hcaptcha ANTES de qualquer navegação para que o mock
-    // seja carregado quando a página do SSO carregar o script.
-    // Sem um token válido de hcaptcha, o botão "Seu certificado digital" nunca navega.
-    await this.page.route(/hcaptcha\.com\/1\/(api|loader)\.js/, async (route) => {
-      console.log('[Scraper] hcaptcha script interceptado — substituindo por mock auto-pass');
-      await route.fulfill({
-        status: 200,
-        contentType: 'application/javascript',
-        body: `
-          (function() {
-            var MOCK_TOKEN = 'P0_eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.mock_auto_${Date.now()}';
-            function fireCbs(token) {
-              ['onHcaptchaSuccess','hcaptchaCallback','onCaptchaSuccess','captchaCallback'].forEach(function(n){
-                if (typeof window[n]==='function') { try { window[n](token); } catch(e){} }
-              });
-              document.querySelectorAll('[data-callback]').forEach(function(el) {
-                var n = el.getAttribute('data-callback');
-                if (n && typeof window[n]==='function') { try { window[n](token); } catch(e){} }
-              });
-            }
-            window.hcaptcha = {
-              _cbs: {},
-              render: function(id, opts) {
-                var key = (typeof id==='string') ? id : (id&&id.id||'x');
-                if (opts && opts.callback) this._cbs[key] = opts.callback;
-                var self = this;
-                setTimeout(function() {
-                  if (self._cbs[key]) try { self._cbs[key](MOCK_TOKEN); } catch(e){}
-                  fireCbs(MOCK_TOKEN);
-                }, 250);
-                return key;
-              },
-              execute: function(id, opts) {
-                var cb = this._cbs[id];
-                setTimeout(function() {
-                  if (cb) try { cb(MOCK_TOKEN); } catch(e){}
-                  if (opts&&opts.callback) try { opts.callback(MOCK_TOKEN); } catch(e){}
-                  fireCbs(MOCK_TOKEN);
-                }, 250);
-                return Promise.resolve({ response: MOCK_TOKEN });
-              },
-              getResponse: function() { return MOCK_TOKEN; },
-              reset: function() {}
-            };
-            if (typeof window.onHcaptchaLoaded==='function') window.onHcaptchaLoaded();
-          })();
-        `
-      });
-    });
-
-    // Interceptar chamadas de API do hcaptcha como backup
-    await this.page.route(/api\.hcaptcha\.com/, async (route) => {
-      const url = route.request().url();
-      if (url.includes('/checksiteconfig')) {
-        await route.fulfill({
-          status: 200, contentType: 'application/json',
-          headers: { 'Access-Control-Allow-Origin': '*' },
-          body: JSON.stringify({ pass: true, c: { type: 'none' } })
-        });
-      } else {
-        await route.fulfill({
-          status: 200, contentType: 'application/json',
-          headers: { 'Access-Control-Allow-Origin': '*' },
-          body: JSON.stringify({ pass: true })
-        });
-      }
-    });
-
-    // Capturar a URL exata quando o botão navegar para /login/certificado
+    // Monitorar quando o botão navegar para o endpoint de cert (depois do hcaptcha passar)
     let certNavUrl = null;
+    const postClickRequests = [];
+    let postClickTime = null;
     this.page.on('request', req => {
       const url = req.url();
       if (url.includes('sso.acesso.gov.br') && url.includes('certificado') && req.isNavigationRequest()) {
         certNavUrl = url;
-        console.log('[Scraper] → Navegação para cert URL detectada:', url.substring(0, 200));
+        console.log('[Scraper] → Navegação cert detectada:', url.substring(0, 200));
+      }
+      // Capturar todos os requests após o clique (para diagnóstico)
+      if (postClickTime && Date.now() - postClickTime < 60000) {
+        if (!url.match(/\.(css|png|jpg|svg|woff|woff2|ico|gif)(\?|$)/)) {
+          postClickRequests.push({ url: url.substring(0, 120), method: req.method(), isNav: req.isNavigationRequest() });
+        }
       }
     });
 
@@ -508,47 +514,18 @@ class ESocialIRRFScraper {
 
     await this.page.screenshot({ path: '/tmp/esocial_03_antes_cert.png' });
 
-    // Injetar também como window override para caso o script já esteja carregado
-    await this.page.evaluate(() => {
-      const MOCK_TOKEN = 'P0_mock_inject_' + Date.now();
-      if (!window.hcaptcha || typeof window.hcaptcha.render !== 'function') {
-        window.hcaptcha = {
-          _cbs: {},
-          render: function(id, opts) {
-            const key = (typeof id === 'string') ? id : (id && id.id || 'x');
-            if (opts && opts.callback) this._cbs[key] = opts.callback;
-            setTimeout(() => {
-              if (this._cbs[key]) try { this._cbs[key](MOCK_TOKEN); } catch(e) {}
-              ['onHcaptchaSuccess','hcaptchaCallback','onCaptchaSuccess'].forEach(n => {
-                if (typeof window[n]==='function') try { window[n](MOCK_TOKEN); } catch(e) {}
-              });
-            }, 200);
-            return key;
-          },
-          execute: function(id, opts) {
-            setTimeout(() => {
-              const cb = this._cbs && this._cbs[id];
-              if (cb) try { cb(MOCK_TOKEN); } catch(e) {}
-            }, 200);
-            return Promise.resolve({ response: MOCK_TOKEN });
-          },
-          getResponse: function() { return MOCK_TOKEN; },
-          reset: function() {}
-        };
-        console.log('[hcaptcha-inject] window.hcaptcha mockado via evaluate');
-      } else {
-        // Patch o hcaptcha existente
-        const orig = window.hcaptcha.execute;
-        window.hcaptcha.execute = function() {
-          console.log('[hcaptcha-inject] execute interceptado');
-          return Promise.resolve({ response: MOCK_TOKEN });
-        };
-        window.hcaptcha.getResponse = function() { return MOCK_TOKEN; };
-        console.log('[hcaptcha-inject] window.hcaptcha existente patchado');
-      }
-    }).catch(e => console.log('[Scraper] PASSO 3: Aviso ao injetar hcaptcha mock:', e.message?.substring(0, 60)));
+    // Log do estado do hcaptcha na página (para diagnóstico de stealth)
+    const hcaptchaInfo = await this.page.evaluate(() => ({
+      webdriver: navigator.webdriver,
+      pluginsLen: navigator.plugins?.length,
+      languages: navigator.languages?.slice(0, 3),
+      hcaptchaPresent: !!window.hcaptcha,
+      chromePresent: !!window.chrome,
+    })).catch(() => null);
+    console.log('[Scraper] PASSO 3: Estado do browser (stealth):', JSON.stringify(hcaptchaInfo));
 
     console.log('[Scraper] PASSO 3: Clicando botão "Seu certificado digital"...');
+    postClickTime = Date.now();
     const clickResult = await this.page.evaluate(() => {
       const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
       let node;
@@ -570,57 +547,35 @@ class ESocialIRRFScraper {
     }).catch(() => null);
     console.log('[Scraper] PASSO 3: Clique:', JSON.stringify(clickResult));
 
-    // Aguardar a navegação para /login/certificado (com hcaptcha mockado, deve acontecer)
+    // hcaptcha real precisa de tempo para avaliar risco e chamar callback
+    // Com stealth (navigator.webdriver=false), pode passar sem challenge visual
     const waitStart = Date.now();
-    const waitTimeout = 30000;
+    const waitTimeout = 60000; // 60 segundos para hcaptcha processar
     let buttonNavCompleted = false;
     while (Date.now() - waitStart < waitTimeout) {
-      await sleep(1000);
+      await sleep(2000);
       const urlNow = this.page.url();
+      const elapsed = Math.round((Date.now() - waitStart) / 1000);
+      if (elapsed % 10 === 0 || elapsed <= 4) {
+        console.log(`[Scraper] PASSO 3 [${elapsed}s]: ${urlNow.substring(0, 100)}`);
+      }
       if (urlNow.includes('/login/certificado') || urlNow.includes('/certificado')) {
-        console.log('[Scraper] PASSO 3: ✓ Botão navegou para cert URL!', urlNow);
+        console.log('[Scraper] PASSO 3: ✓ hcaptcha PASSOU! Botão navegou:', urlNow);
         buttonNavCompleted = true;
         break;
       }
       if (!urlNow.includes('sso.acesso.gov.br')) {
         console.log('[Scraper] PASSO 3: ✓ Saiu do SSO! URL:', urlNow);
-        console.log('[Scraper] === LOGIN CONCLUÍDO (botão hcaptcha mockado) ===');
+        console.log('[Scraper] === LOGIN CONCLUÍDO ===');
         return;
       }
     }
-    console.log('[Scraper] PASSO 3: URL após espera:', this.page.url(), '| certNavUrl:', certNavUrl);
-    await this.page.screenshot({ path: '/tmp/esocial_03_apos_clique.png' });
 
-    // Se o botão não navegou (hcaptcha ainda bloqueou), usar Node.js mTLS como fallback
-    if (!buttonNavCompleted && authorizationId) {
-      console.log('[Scraper] PASSO 3: Botão não navegou. Tentando Node.js mTLS como fallback...');
-      const certUrl = `https://sso.acesso.gov.br/login/certificado?client_id=login.esocial.gov.br&authorization_id=${authorizationId}`;
-      const ssoCookies = await this.context.cookies('https://sso.acesso.gov.br');
-      const cookieStr = ssoCookies.map(c => `${c.name}=${c.value}`).join('; ');
-
-      try {
-        const mtlsResp = await doMtlsRequest(certUrl, this.pfxBuffer, this.password, {
-          Cookie: cookieStr,
-          Referer: `https://sso.acesso.gov.br/login?client_id=login.esocial.gov.br&authorization_id=${authorizationId}`,
-        });
-        console.log('[Scraper] PASSO 3: mTLS status:', mtlsResp.status, '| location:', mtlsResp.location);
-        console.log('[Scraper] PASSO 3: mTLS body:', mtlsResp.body.substring(0, 150).replace(/\n/g, ' '));
-
-        if (mtlsResp.status >= 300 && mtlsResp.status < 400 && mtlsResp.location) {
-          let callbackUrl = mtlsResp.location.startsWith('/') ?
-            'https://sso.acesso.gov.br' + mtlsResp.location : mtlsResp.location;
-          console.log('[Scraper] PASSO 3: ✓ mTLS redirect! Navegando para:', callbackUrl);
-          await this.page.goto(callbackUrl, { waitUntil: 'networkidle', timeout: 60000 }).catch(() => {});
-          if (!this.page.url().includes('sso.acesso.gov.br')) {
-            console.log('[Scraper] === LOGIN CONCLUÍDO via mTLS ===');
-            return;
-          }
-        }
-      } catch (mtlsErr) {
-        console.log('[Scraper] PASSO 3: mTLS erro:', mtlsErr.message?.substring(0, 150));
-        if (mtlsErr.code) console.log('[Scraper] PASSO 3: mTLS código:', mtlsErr.code);
-      }
+    if (postClickRequests.length > 0) {
+      console.log('[Scraper] PASSO 3: Requests após clique:', JSON.stringify(postClickRequests.slice(0, 15)));
     }
+    console.log('[Scraper] PASSO 3: URL final:', this.page.url());
+    await this.page.screenshot({ path: '/tmp/esocial_03_apos_clique.png' });
 
     // ============================================
     // PASSO 4: Aguardar autenticação por certificado
