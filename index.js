@@ -19,6 +19,7 @@ const https = require('https');
 const cors = require('cors');
 const { ESocialIRRFScraper } = require('./scraper/irrf-scraper');
 const certStore = require('./certificates');
+const esocialWS = require('./scraper/esocial-webservice');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -285,6 +286,105 @@ app.post('/api/esocial-irrf', rateLimit, async (req, res) => {
 });
 
 // ============================================================
+// NOVO ENDPOINT: Webservice SOAP (mTLS + assinatura XML) para IRRF (S-5002)
+// Não usa browser/scraping - acessa diretamente os webservices oficiais
+// do eSocial (ConsultarIdentificadoresEventosEmpregador + SolicitarDownloadEventosPorId)
+// ============================================================
+app.post('/api/esocial-irrf-ws', rateLimit, async (req, res) => {
+  const startTime = Date.now();
+
+  try {
+    let { cnpj, certificatePfx, password, cpfs, periodos } = req.body;
+
+    if (cnpj && !certificatePfx) {
+      const stored = certStore.getCertificate(cnpj);
+      if (!stored) {
+        return res.status(404).json({
+          success: false,
+          error: `Nenhum certificado cadastrado para o CNPJ ${cnpj}. Use POST /api/certificates para cadastrar.`
+        });
+      }
+      certificatePfx = stored.certificatePfx;
+      password = stored.password;
+      cnpj = stored.cnpj;
+      console.log(`[eSocial IRRF-WS] Usando certificado cadastrado para CNPJ ${stored.cnpj} (${stored.nome})`);
+    }
+
+    if (!certificatePfx || !password || !cnpj) {
+      return res.status(400).json({
+        success: false,
+        error: 'Forneça cnpj (empresa cadastrada) ou cnpj + certificatePfx + password'
+      });
+    }
+
+    if (!cpfs || !Array.isArray(cpfs) || cpfs.length === 0) {
+      return res.status(400).json({ success: false, error: 'Lista de CPFs é obrigatória' });
+    }
+    if (!periodos || !Array.isArray(periodos) || periodos.length === 0) {
+      return res.status(400).json({ success: false, error: 'Lista de períodos é obrigatória' });
+    }
+
+    console.log(`[eSocial IRRF-WS] Request: CNPJ ${cnpj}, ${cpfs.length} CPFs, ${periodos.length} períodos`);
+
+    const pfxBuffer = Buffer.from(certificatePfx, 'base64');
+    const cpfsClean = cpfs.map((c) => String(c).replace(/\D/g, ''));
+
+    const data = [];
+
+    for (const perApur of periodos) {
+      let periodResult;
+      try {
+        periodResult = await esocialWS.getIrrfXmlsForPeriod({
+          cnpj, perApur, cpfs: cpfsClean, pfxBuffer, passphrase: password
+        });
+      } catch (err) {
+        periodResult = { perApur, success: false, error: err.message };
+      }
+
+      if (!periodResult.success) {
+        console.error(`[eSocial IRRF-WS] Erro no período ${perApur}: ${periodResult.error}`);
+        for (const cpf of cpfsClean) {
+          data.push({
+            cpf, periodo: perApur, success: false,
+            error: periodResult.error,
+            debug: periodResult.raw ? periodResult.raw.substring(0, 2000) : undefined
+          });
+        }
+        continue;
+      }
+
+      const encontradosPorCpf = new Map(periodResult.encontrados.map((e) => [e.cpf, e.xml]));
+
+      for (const cpf of cpfsClean) {
+        if (encontradosPorCpf.has(cpf)) {
+          data.push({ cpf, periodo: perApur, success: true, xml: encontradosPorCpf.get(cpf) });
+        } else {
+          data.push({
+            cpf, periodo: perApur, success: false,
+            error: periodResult.info || 'Evento S-5002 não encontrado para este CPF/período',
+          });
+        }
+      }
+    }
+
+    const elapsed = Date.now() - startTime;
+    const successCount = data.filter((r) => r.success).length;
+    console.log(`[eSocial IRRF-WS] Completed: ${successCount}/${data.length} successful in ${elapsed}ms`);
+
+    res.json({
+      success: true,
+      data,
+      summary: { total: data.length, successful: successCount, failed: data.length - successCount },
+      elapsed
+    });
+  } catch (error) {
+    const elapsed = Date.now() - startTime;
+    console.error(`[eSocial IRRF-WS] Error after ${elapsed}ms:`, error.message);
+    res.status(500).json({ success: false, error: error.message, elapsed });
+  }
+});
+
+// ============================================================
 // ENDPOINT EXISTENTE: mTLS direto (mantido para compatibilidade)
 // ============================================================
 app.post('/api/esocial', rateLimit, async (req, res) => {
@@ -519,4 +619,5 @@ app.listen(PORT, () => {
   console.log(`  eSocial:`);
   console.log(`    POST   /api/esocial               - mTLS direto (aceita cnpj ou PEM)`);
   console.log(`    POST   /api/esocial-irrf          - Web Scraping IRRF (aceita cnpj ou PFX)`);
+  console.log(`    POST   /api/esocial-irrf-ws       - Webservice SOAP/mTLS IRRF S-5002 (aceita cnpj ou PFX)`);
 });
